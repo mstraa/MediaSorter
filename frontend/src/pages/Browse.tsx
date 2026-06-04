@@ -241,14 +241,8 @@ export default function BrowsePage() {
         </div>
 
         <div className="pathbar">
-          <span className="muted">Current path: /{data.current_path}</span>
-          {data.current_path && (
-            <button className="link-button" type="button" onClick={() => openFolder(data.parent_path)}>
-              Up one folder
-            </button>
-          )}
           <button
-            className="icon-button pathbar-refresh"
+            className="icon-button"
             type="button"
             onClick={load}
             aria-label="Refresh"
@@ -256,6 +250,12 @@ export default function BrowsePage() {
           >
             ↻
           </button>
+          <span className="muted">Current path: /{data.current_path}</span>
+          {data.current_path && (
+            <button className="link-button" type="button" onClick={() => openFolder(data.parent_path)}>
+              Up one folder
+            </button>
+          )}
         </div>
       </div>
 
