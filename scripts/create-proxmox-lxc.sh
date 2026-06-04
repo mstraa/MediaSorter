@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 APP_NAME="TvSorter"
-DEFAULT_REPO="https://github.com/mstraa/TvSorterV2.git"
+DEFAULT_REPO="https://github.com/mstraa/MediaSorter.git"
 DEFAULT_BRANCH="main"
 
 CTID=""
@@ -50,7 +50,7 @@ Common options:
   --memory MiB                 RAM in MiB (default: 4096)
   --swap MiB                   Swap in MiB (default: 1024)
   --disk GiB                   Root disk size in GiB (default: 14)
-  --repo URL                   Git repo to install (default: https://github.com/mstraa/TvSorterV2.git)
+  --repo URL                   Git repo to install (default: https://github.com/mstraa/MediaSorter.git)
   --branch NAME                Git branch to install (default: main)
   --ssh-public-key PATH        SSH public key for root login
   --root-password PASSWORD     Root password for the container
@@ -409,8 +409,8 @@ INSTALL
 
 log "Installing TvSorter inside LXC $CTID (this compiles from source and can take several minutes)"
 pct push "$CTID" "$install_script" /root/install-tvsorter.sh -perms 0755
-UPDATE_URL="https://raw.githubusercontent.com/mstraa/TvSorterV2/${REPO_BRANCH}/scripts/update-tvsorter.sh"
-BUILD_URL="https://raw.githubusercontent.com/mstraa/TvSorterV2/${REPO_BRANCH}/scripts/build-app.sh"
+UPDATE_URL="https://raw.githubusercontent.com/mstraa/MediaSorter/${REPO_BRANCH}/scripts/update-tvsorter.sh"
+BUILD_URL="https://raw.githubusercontent.com/mstraa/MediaSorter/${REPO_BRANCH}/scripts/build-app.sh"
 pct exec "$CTID" -- /root/install-tvsorter.sh "$REPO_URL" "$REPO_BRANCH" "$UPDATE_URL" "$BUILD_URL"
 
 [[ "$START" == "0" ]] && { log "Stopping LXC $CTID because --no-start was requested"; pct stop "$CTID"; }
