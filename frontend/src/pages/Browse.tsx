@@ -20,6 +20,13 @@ const STATUS_FILTERS = [
 
 const MANUAL_STATUSES = ["imported", "failed", "skipped", "preview", "conflict"];
 
+const MEDIA_TYPES: { value: MediaType; label: string }[] = [
+  { value: "tv", label: "TV" },
+  { value: "anime", label: "Anime" },
+  { value: "film", label: "Film" },
+  { value: "music", label: "Music" },
+];
+
 export default function BrowsePage() {
   const [searchParams, setSearchParams] = useSearchParams();
   const navigate = useNavigate();
@@ -201,19 +208,22 @@ export default function BrowsePage() {
               options={data.roots.map((root) => ({ value: String(root.id), label: root.path }))}
             />
           </label>
-          <label>
+          <div className="toolbar-field">
             Type
-            <Select
-              value={mediaType}
-              onChange={(v) => setMediaType(v as MediaType)}
-              options={[
-                { value: "tv", label: "TV" },
-                { value: "anime", label: "Anime" },
-                { value: "film", label: "Film" },
-                { value: "music", label: "Music" },
-              ]}
-            />
-          </label>
+            <div className="segmented" role="group" aria-label="Type">
+              {MEDIA_TYPES.map((option) => (
+                <button
+                  key={option.value}
+                  type="button"
+                  className={`segmented-button ${mediaType === option.value ? "active" : ""}`}
+                  aria-pressed={mediaType === option.value}
+                  onClick={() => setMediaType(option.value)}
+                >
+                  {option.label}
+                </button>
+              ))}
+            </div>
+          </div>
           <button type="button" onClick={matchSelected}>
             Match Selected
           </button>

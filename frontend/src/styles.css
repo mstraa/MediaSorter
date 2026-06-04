@@ -512,6 +512,47 @@ button:disabled {
   margin-bottom: 0.85rem;
 }
 
+.toolbar-field {
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+  font-family: var(--mono);
+  font-size: 11px;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.segmented {
+  display: flex;
+}
+
+.segmented-button {
+  border-color: var(--line);
+  background: var(--panel);
+  color: var(--muted);
+  font-weight: 500;
+}
+
+.segmented-button:not(:first-child) {
+  margin-left: -1px;
+}
+
+.segmented-button:hover:not(:disabled):not(.active) {
+  border-color: var(--orange-dim);
+  background: var(--orange-tint);
+  color: var(--text);
+  position: relative;
+}
+
+.segmented-button.active {
+  border-color: var(--orange-dim);
+  background: var(--orange-tint);
+  color: var(--orange);
+  font-weight: 700;
+  position: relative;
+  z-index: 1;
+}
+
 .compact-toolbar {
   align-items: center;
 }
