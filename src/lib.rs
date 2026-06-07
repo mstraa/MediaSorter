@@ -1,4 +1,4 @@
-//! TvSorter core library.
+//! MediaSorter core library.
 //!
 //! The HTTP server and all domain logic live here so that multiple front-ends
 //! can reuse them:
@@ -74,7 +74,7 @@ pub async fn serve(config: AppConfig) {
         .parse()
         .expect("invalid host/port");
     let app = build_app(config);
-    tracing::info!("TvSorter listening on http://{addr}");
+    tracing::info!("MediaSorter listening on http://{addr}");
 
     let listener = tokio::net::TcpListener::bind(addr)
         .await
@@ -99,7 +99,7 @@ pub fn spawn_embedded() -> SocketAddr {
         .expect("failed to read embedded server address");
     config.host = addr.ip().to_string();
     config.port = addr.port();
-    tracing::info!("TvSorter embedded server on http://{addr}");
+    tracing::info!("MediaSorter embedded server on http://{addr}");
 
     let app = build_app(config);
 

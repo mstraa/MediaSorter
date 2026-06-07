@@ -1,4 +1,4 @@
-//! TvSorter server binary (LXC / systemd deployment).
+//! MediaSorter server binary (LXC / systemd deployment).
 //!
 //! Domain logic and the HTTP app live in the `tvsorter` library crate
 //! (`src/lib.rs`) so the desktop build (`src-tauri`) can reuse them.

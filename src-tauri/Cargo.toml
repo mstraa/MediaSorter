@@ -2,7 +2,7 @@
 name = "tvsorter-desktop"
 version = "0.4.1"
 edition = "2021"
-description = "TvSorter desktop app — embeds the TvSorter server in a native window"
+description = "MediaSorter desktop app — embeds the MediaSorter server in a native window"
 license = "MIT"
 
 # Standalone crate (NOT part of the root crate / not a workspace member), so the

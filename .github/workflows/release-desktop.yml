@@ -1,6 +1,6 @@
 name: Release desktop apps
 
-# Builds the TvSorter Tauri desktop app for macOS, Windows, and Linux and
+# Builds the MediaSorter Tauri desktop app for macOS, Windows, and Linux and
 # attaches the unsigned installers to a draft GitHub release.
 #
 # Triggers when a tag like `v0.2.0` is pushed. Builds are UNSIGNED (no
@@ -74,7 +74,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           tagName: ${{ github.ref_name }}
-          releaseName: "TvSorter ${{ github.ref_name }}"
+          releaseName: "MediaSorter ${{ github.ref_name }}"
           releaseDraft: true
           prerelease: false
           args: ${{ matrix.args }}

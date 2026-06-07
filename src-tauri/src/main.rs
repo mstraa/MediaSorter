@@ -1,4 +1,4 @@
-//! TvSorter desktop entry point.
+//! MediaSorter desktop entry point.
 //!
 //! Strategy: "embedded server". We start the exact same axum server used for
 //! the LXC deployment on a loopback port, then point a native Tauri webview at
@@ -21,12 +21,12 @@ fn main() {
     tauri::Builder::default()
         .setup(move |app| {
             WebviewWindowBuilder::new(app, "main", webview_url.clone())
-                .title("TvSorter")
+                .title("MediaSorter")
                 .inner_size(1200.0, 800.0)
                 .min_inner_size(900.0, 600.0)
                 .build()?;
             Ok(())
         })
         .run(tauri::generate_context!())
-        .expect("error while running TvSorter desktop");
+        .expect("error while running MediaSorter desktop");
 }

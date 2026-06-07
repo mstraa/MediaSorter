@@ -46,9 +46,9 @@ fn serve_index() -> Response {
 }
 
 const DEV_PLACEHOLDER: &str = r#"<!doctype html>
-<html><head><meta charset="utf-8"><title>TvSorter</title></head>
+<html><head><meta charset="utf-8"><title>MediaSorter</title></head>
 <body style="font-family:sans-serif;padding:2rem">
-<h1>TvSorter API is running</h1>
+<h1>MediaSorter API is running</h1>
 <p>The frontend bundle is not embedded. In development, run the Vite dev server
 (<code>cd frontend &amp;&amp; npm run dev</code>) which proxies the API. In production,
 build the frontend (<code>npm run build</code>) before <code>cargo build --release</code>.</p>

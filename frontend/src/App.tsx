@@ -52,8 +52,8 @@ export default function App() {
           <div className="brand">
             <span className="prompt-mark">▸</span>
             <div>
-              <h1>TvSorter</h1>
-              <p className="eyebrow">media sorter</p>
+              <h1>MediaSorter</h1>
+              <p className="eyebrow">tv · anime · film · music</p>
             </div>
           </div>
 
