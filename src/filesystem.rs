@@ -28,7 +28,14 @@ pub struct BrowserEntry {
     pub size: Option<i64>,
     pub is_video: bool,
     /// True when the file has more than one hard link (nlink > 1 on Unix).
-    pub is_hardlink: bool,
+    /// On its own this does not mean the file is linked into a library —
+    /// seeding tools, *arr imports, and dedup jobs also hardlink sources.
+    /// Pair it with [`BrowserEntry::dev_inode`] against recorded imports.
+    pub has_extra_links: bool,
+    /// `(st_dev, st_ino)` for files on Unix, `None` for directories and on
+    /// other platforms. Matches the `source_device`/`source_inode` columns
+    /// recorded on imports.
+    pub dev_inode: Option<(i64, i64)>,
 }
 
 /// Lexically normalize an absolute-ish path, resolving `.` and `..` without
@@ -77,6 +84,17 @@ fn hard_link_count(meta: &fs::Metadata) -> u64 {
 #[cfg(not(unix))]
 fn hard_link_count(_meta: &fs::Metadata) -> u64 {
     1
+}
+
+#[cfg(unix)]
+fn dev_inode(meta: &fs::Metadata) -> Option<(i64, i64)> {
+    use std::os::unix::fs::MetadataExt;
+    Some((meta.dev() as i64, meta.ino() as i64))
+}
+
+#[cfg(not(unix))]
+fn dev_inode(_meta: &fs::Metadata) -> Option<(i64, i64)> {
+    None
 }
 
 /// Modification time as seconds since the Unix epoch, matching how mtimes are
@@ -147,7 +165,7 @@ pub fn list_directory(root: &Path, relative_path: &str) -> Result<Vec<BrowserEnt
             Err(_) => continue,
         };
         let is_dir = metadata.is_dir();
-        let is_hardlink = !is_dir && hard_link_count(&metadata) > 1;
+        let has_extra_links = !is_dir && hard_link_count(&metadata) > 1;
         entries.push(BrowserEntry {
             name: child
                 .file_name()
@@ -162,7 +180,8 @@ pub fn list_directory(root: &Path, relative_path: &str) -> Result<Vec<BrowserEnt
                 Some(metadata.len() as i64)
             },
             is_video: is_video_file(&child),
-            is_hardlink,
+            has_extra_links,
+            dev_inode: if is_dir { None } else { dev_inode(&metadata) },
         });
     }
     Ok(entries)
@@ -385,6 +404,33 @@ mod tests {
         let groups = expand_grouped(&dir, &["sub".to_string()]).unwrap();
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].files.len(), 1);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn reports_extra_links_and_inode_identity() {
+        let dir = std::env::temp_dir().join(format!("tvsorter-ln-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        File::create(dir.join("plain.mkv")).unwrap();
+        File::create(dir.join("linked.mkv")).unwrap();
+        fs::hard_link(dir.join("linked.mkv"), dir.join("twin.mkv")).unwrap();
+
+        let entries = list_directory(&dir, "").unwrap();
+        let by_name = |name: &str| entries.iter().find(|e| e.name == name).unwrap();
+        assert!(!by_name("plain.mkv").has_extra_links);
+        assert!(by_name("linked.mkv").has_extra_links);
+        assert!(by_name("twin.mkv").has_extra_links);
+        // Both links share one inode; the plain file has its own.
+        assert!(by_name("linked.mkv").dev_inode.is_some());
+        assert_eq!(
+            by_name("linked.mkv").dev_inode,
+            by_name("twin.mkv").dev_inode
+        );
+        assert_ne!(
+            by_name("plain.mkv").dev_inode,
+            by_name("linked.mkv").dev_inode
+        );
         fs::remove_dir_all(&dir).ok();
     }
 

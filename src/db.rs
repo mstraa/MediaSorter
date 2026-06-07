@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -365,6 +365,25 @@ impl Database {
             Err(_) => return Vec::new(),
         };
         stmt.query_map(params![like], map_import_row)
+            .map(|iter| iter.filter_map(Result::ok).collect())
+            .unwrap_or_default()
+    }
+
+    /// `(source_device, source_inode)` of every source successfully imported
+    /// with the hardlink action. A browse entry whose device/inode pair appears
+    /// here shares its inode with a library file created by this app — the only
+    /// situation the UI should label "hardlink".
+    pub fn hardlink_source_idents(&self) -> HashSet<(i64, i64)> {
+        let conn = self.lock();
+        let mut stmt = match conn.prepare(
+            "SELECT DISTINCT source_device, source_inode FROM imports
+            WHERE action = 'hardlink' AND result = 'imported'
+                AND source_device IS NOT NULL AND source_inode IS NOT NULL",
+        ) {
+            Ok(stmt) => stmt,
+            Err(_) => return HashSet::new(),
+        };
+        stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
             .map(|iter| iter.filter_map(Result::ok).collect())
             .unwrap_or_default()
     }
@@ -775,6 +794,43 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].source_path, child.to_string_lossy());
         assert_eq!(rows[0].result, "imported");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn hardlink_source_idents_keeps_only_successful_hardlinks() {
+        let dir = std::env::temp_dir().join(format!("tvsorter-db-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = Database::open(&dir.join("test.db")).unwrap();
+
+        let mut linked = record("/in/linked.mkv");
+        linked.action = "hardlink".to_string();
+        linked.source_device = Some(7);
+        linked.source_inode = Some(42);
+        db.insert_import(&linked);
+
+        // Copied: shares no inode with the library, must not count.
+        let mut copied = record("/in/copied.mkv");
+        copied.action = "copy".to_string();
+        copied.source_device = Some(7);
+        copied.source_inode = Some(43);
+        db.insert_import(&copied);
+
+        // Failed hardlink: nothing was linked, must not count.
+        let mut failed = record("/in/failed.mkv");
+        failed.action = "hardlink".to_string();
+        failed.result = "failed".to_string();
+        failed.source_device = Some(7);
+        failed.source_inode = Some(44);
+        db.insert_import(&failed);
+
+        // Hardlink without stat data: cannot be matched, must not count.
+        let mut no_stat = record("/in/nostat.mkv");
+        no_stat.action = "hardlink".to_string();
+        db.insert_import(&no_stat);
+
+        let idents = db.hardlink_source_idents();
+        assert_eq!(idents, HashSet::from([(7, 42)]));
         std::fs::remove_dir_all(&dir).ok();
     }
 

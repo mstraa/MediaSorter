@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use axum::extract::{Path as AxumPath, Query, State};
@@ -215,6 +215,17 @@ fn browse_directory(
         Err(e) => return (Vec::new(), Some(e.to_string()), String::new()),
     };
 
+    // A file is only typed "hardlink" when the filesystem reports extra links
+    // AND this app recorded a successful hardlink import of that same inode.
+    // nlink > 1 alone proves nothing about the library: seeding tools, *arr
+    // imports, and dedup jobs also hardlink sources, and those must stay
+    // importable.
+    let hardlink_idents = if listed.iter().any(|e| e.has_extra_links) {
+        state.db.hardlink_source_idents()
+    } else {
+        HashSet::new()
+    };
+
     // Files imported from a folder and then moved out of the input tree no
     // longer exist to be listed, but the folder should still reflect that they
     // were imported. Fetch every such record under the *current* directory in
@@ -267,7 +278,10 @@ fn browse_directory(
             relative_path: entry.relative_path,
             is_dir: entry.is_dir,
             is_video: entry.is_video,
-            is_hardlink: entry.is_hardlink,
+            is_hardlink: entry.has_extra_links
+                && entry
+                    .dev_inode
+                    .is_some_and(|ident| hardlink_idents.contains(&ident)),
             size: entry.size,
             size_human: human_file_size(entry.size),
             status: status.status,
