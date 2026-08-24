@@ -78,7 +78,10 @@ cd frontend && npm run build   # type-check + bundle the frontend
   `Artist/Album` folder convention, then to filename parsing; files keep their
   original names under `Artist/Album (Year)/`.
 - Look up TV metadata with TVMaze, anime metadata with Jikan, and film metadata with IMDb-style public suggestions plus Wikidata fallback.
-- Cache provider responses in SQLite and de-duplicate metadata lookups during batch matching.
+- Cache provider responses in SQLite (24-hour TTL, so an airing show picks up new
+  episodes) and de-duplicate metadata lookups during batch matching.
+- Skip a file whose destination resolves back to itself, so re-scanning an
+  already-sorted library never rewrites or duplicates it.
 - Manually correct every match field before import (title, year, season, episode, episode title, quality, provider, provider ID).
 - **Match exclusion:** include/exclude individual items or whole folders/albums
   from the match queue before importing.
@@ -180,6 +183,17 @@ Environment variables:
 - `TVSORTER_DATABASE`: explicit SQLite database path
 - `TVSORTER_HOST`: service host, default `0.0.0.0`
 - `TVSORTER_PORT`: service port, default `8080`
+- `TVSORTER_CORS_ORIGINS`: extra comma-separated origins allowed to call the API.
+  The UI is served from the same origin as the API, so nothing is needed for
+  normal use; `http://127.0.0.1:5173` and `http://localhost:5173` (the Vite dev
+  server) are always allowed. Set this only if you run the dev server on a
+  different host.
+
+> **Security:** the API has no authentication and, with the default
+> `TVSORTER_HOST=0.0.0.0`, is reachable from anywhere on the LAN. Anyone who can
+> reach the port can browse the server's filesystem and move media around. Run it
+> only on a trusted network, or set `TVSORTER_HOST=127.0.0.1` and put it behind a
+> reverse proxy that handles authentication.
 
 Runtime settings saved through the UI:
 

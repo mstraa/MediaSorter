@@ -2,6 +2,14 @@ import { Link } from "react-router-dom";
 import { api } from "../api";
 import { useImports } from "../components/ImportsContext";
 import { formatBytes } from "../theme";
+
+// Hardlink and dry-run items are counted as whole items, not bytes; rendering
+// those through formatBytes produced nonsense like "0 o / 12 o".
+function formatProgress(value: number, unit: string): string {
+  if (unit === "bytes") return formatBytes(value);
+  if (unit === "items") return `${value} item${value === 1 ? "" : "s"}`;
+  return String(value);
+}
 import type { JobItem, JobSnapshot } from "../types";
 
 const TERMINAL_ITEM_STATES = new Set(["imported", "skipped", "preview", "failed", "cancelled"]);
@@ -109,7 +117,8 @@ function JobCard({ job, onCancelJob, onCancelItem }: JobCardProps) {
             <span style={{ width: `${job.percent}%` }} />
           </div>
           <span className="muted import-progress-text">
-            {job.percent}% · {formatBytes(job.completed)} / {formatBytes(job.total)}
+            {job.percent}% · {formatProgress(job.completed, job.unit)} /{" "}
+            {formatProgress(job.total, job.unit)}
           </span>
         </div>
       </div>
@@ -139,9 +148,9 @@ function JobCard({ job, onCancelJob, onCancelItem }: JobCardProps) {
               <td className="col-dest muted">{baseName(item.destination) || "—"}</td>
               <td className="col-progress muted">
                 {item.status === "running" && item.total > 0
-                  ? `${formatBytes(item.bytes)} / ${formatBytes(item.total)}`
+                  ? `${formatProgress(item.bytes, item.unit)} / ${formatProgress(item.total, item.unit)}`
                   : item.status === "imported"
-                    ? formatBytes(item.total)
+                    ? formatProgress(item.total, item.unit)
                     : ""}
               </td>
               <td className="col-cancel">

@@ -175,6 +175,13 @@ fn indexed_path(path: &Path) -> Result<PathBuf, ConflictError> {
 
 pub fn preview_import(request: ImportRequest) -> ImportResult {
     let output_path = build_destination(&request);
+
+    // Mirror the `execute_import` self-import guard so the preview does not
+    // promise an import that will be skipped.
+    if is_same_file(&request.source_path, &output_path) {
+        return ImportResult::new(request, output_path.clone(), output_path, "skipped");
+    }
+
     match apply_conflict_policy(&output_path, &request.conflict_policy) {
         Ok(final_path) => {
             let result = if output_path.exists() && final_path == output_path {
@@ -197,6 +204,18 @@ pub fn execute_import(
     cancel: Option<CancelFn<'_>>,
 ) -> ImportResult {
     let output_path = build_destination(&request);
+
+    // The file is already sitting at its own destination. This happens when an
+    // already-sorted library is re-added as an input root and re-imported: the
+    // naming is deterministic, so a correctly-named file maps back onto itself.
+    // Checked before the conflict policy runs, because every policy gets this
+    // wrong — `replace` unlinks the source before the copy (and a copy onto its
+    // own path truncates it), `index` duplicates the whole library beside
+    // itself, and `fail` reports a spurious conflict against the file itself.
+    if is_same_file(&request.source_path, &output_path) {
+        return ImportResult::new(request, output_path.clone(), output_path, "skipped");
+    }
+
     let final_path = match apply_conflict_policy(&output_path, &request.conflict_policy) {
         Ok(path) => path,
         Err(ConflictError::Exists(message)) => {
@@ -228,9 +247,11 @@ pub fn execute_import(
         }
     }
 
-    if final_path.exists() && request.conflict_policy == "replace" {
-        let _ = fs::remove_file(&final_path);
-    }
+    // Every action writes to a hidden sibling first and renames it into place.
+    // That keeps `replace` non-destructive: the file already in the library is
+    // only unlinked once its replacement is complete on disk, so a failure
+    // mid-copy can no longer leave the user with neither.
+    let staging = staging_path(&final_path);
 
     let action = request.action.clone();
     match action.as_str() {
@@ -238,7 +259,7 @@ pub fn execute_import(
             if cancelled(cancel) {
                 return cancelled_result(request, output_path, final_path);
             }
-            if let Err(err) = fs::hard_link(&request.source_path, &final_path) {
+            if let Err(err) = fs::hard_link(&request.source_path, &staging) {
                 if err.raw_os_error() == Some(EXDEV) {
                     return ImportResult::with_error(
                         request,
@@ -251,23 +272,34 @@ pub fn execute_import(
                 }
                 return io_failure(request, output_path, final_path, &err);
             }
+            if let Err(err) = promote_staged(&staging, &final_path) {
+                remove_partial(&staging);
+                return io_failure(request, output_path, final_path, &err);
+            }
             if let Some(progress) = progress {
                 progress(1, 1);
             }
         }
-        "copy" => match copy_step(
-            &request.source_path,
-            &final_path,
-            progress,
-            copy_rate_limit_mbps,
-            cancel,
-        ) {
-            CopyStep::Done => {}
-            CopyStep::Cancelled => return cancelled_result(request, output_path, final_path),
-            CopyStep::Failed(err) => return io_failure(request, output_path, final_path, &err),
-        },
+        "copy" => {
+            match copy_step(
+                &request.source_path,
+                &staging,
+                progress,
+                copy_rate_limit_mbps,
+                cancel,
+            ) {
+                CopyStep::Done => {}
+                CopyStep::Cancelled => return cancelled_result(request, output_path, final_path),
+                CopyStep::Failed(err) => return io_failure(request, output_path, final_path, &err),
+            }
+            if let Err(err) = promote_staged(&staging, &final_path) {
+                remove_partial(&staging);
+                return io_failure(request, output_path, final_path, &err);
+            }
+        }
         "move" => {
-            // Try rename first (same filesystem, atomic and instant).
+            // Try rename first (same filesystem, atomic and instant). On Unix
+            // this already replaces an existing destination atomically.
             match fs::rename(&request.source_path, &final_path) {
                 Ok(()) => {
                     if let Some(progress) = progress {
@@ -278,14 +310,12 @@ pub fn execute_import(
                 Err(rename_err) if rename_err.raw_os_error() == Some(EXDEV) => {
                     match copy_step(
                         &request.source_path,
-                        &final_path,
+                        &staging,
                         progress,
                         copy_rate_limit_mbps,
                         cancel,
                     ) {
-                        CopyStep::Done => {
-                            let _ = fs::remove_file(&request.source_path);
-                        }
+                        CopyStep::Done => {}
                         CopyStep::Cancelled => {
                             return cancelled_result(request, output_path, final_path)
                         }
@@ -293,9 +323,41 @@ pub fn execute_import(
                             return io_failure(request, output_path, final_path, &err)
                         }
                     }
+                    if let Err(err) = promote_staged(&staging, &final_path) {
+                        remove_partial(&staging);
+                        return io_failure(request, output_path, final_path, &err);
+                    }
+                    // The copy is synced and in place; only now is dropping the
+                    // source safe. Report a failure to remove it rather than
+                    // claiming a move that left the original behind.
+                    if let Err(err) = fs::remove_file(&request.source_path) {
+                        return ImportResult::with_error(
+                            request,
+                            output_path,
+                            final_path,
+                            "failed",
+                            format!(
+                                "Copied to the destination but could not remove the source: {err}"
+                            ),
+                        );
+                    }
                 }
                 Err(rename_err) => {
-                    return io_failure(request, output_path, final_path, &rename_err)
+                    // Windows `rename` refuses an existing destination; on a
+                    // `replace` that is the intended outcome, so retry through
+                    // the same replace path the other actions use.
+                    if request.conflict_policy == "replace" && final_path.exists() {
+                        if let Err(err) = fs::remove_file(&final_path)
+                            .and_then(|()| fs::rename(&request.source_path, &final_path))
+                        {
+                            return io_failure(request, output_path, final_path, &err);
+                        }
+                        if let Some(progress) = progress {
+                            progress(1, 1);
+                        }
+                    } else {
+                        return io_failure(request, output_path, final_path, &rename_err);
+                    }
                 }
             }
         }
@@ -340,6 +402,23 @@ fn write_origin_xattr(path: &Path, origin: &str) {
 
 #[cfg(not(unix))]
 fn write_origin_xattr(_path: &Path, _origin: &str) {}
+
+/// True when `a` and `b` name the same file on disk.
+///
+/// Prefers `(st_dev, st_ino)` when both paths exist, which also catches the
+/// case where the destination is already a hardlink of the source. Falls back
+/// to comparing canonicalized paths, which is what applies while the
+/// destination does not exist yet (the normal, safe case).
+fn is_same_file(a: &Path, b: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if let (Ok(am), Ok(bm)) = (fs::metadata(a), fs::metadata(b)) {
+            return am.dev() == bm.dev() && am.ino() == bm.ino();
+        }
+    }
+    crate::filesystem::canonical_or_normalized(a) == crate::filesystem::canonical_or_normalized(b)
+}
 
 fn cancelled(cancel: Option<CancelFn<'_>>) -> bool {
     cancel.map(|c| c()).unwrap_or(false)
@@ -426,7 +505,24 @@ fn copy_with_progress(
         }
     }
     writer.flush()?;
+    // `flush` is a no-op on a File and `drop` would discard any close error, so
+    // neither proves the bytes reached the disk. A `move` deletes the source
+    // right after this returns, so an unsynced copy means a crash or power loss
+    // between the two loses the file outright. `sync_all` also surfaces
+    // deferred write errors (ENOSPC, EIO on a network mount) that only appear
+    // at flush time.
+    writer.sync_all()?;
     drop(writer);
+
+    // A short write with no error is possible on some filesystems; refuse to
+    // report success on a truncated copy, which for `move` would be fatal.
+    if copied != total {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            format!("copied {copied} of {total} bytes"),
+        ));
+    }
+
     copy_stat(source, destination);
     if let Some(progress) = progress {
         progress(total, total);
@@ -464,6 +560,39 @@ fn copy_stat(source: &Path, destination: &Path) {
 fn remove_partial(path: &Path) {
     if path.exists() {
         let _ = fs::remove_file(path);
+    }
+}
+
+/// A hidden sibling of `final_path` to stage the new file into.
+///
+/// Same directory, so the follow-up rename stays on one filesystem and is
+/// atomic. The name is a fixed short length rather than derived from
+/// `final_path`, whose own basename may already sit at the 255-byte limit.
+fn staging_path(final_path: &Path) -> PathBuf {
+    let unique = uuid::Uuid::new_v4().simple().to_string();
+    let name = format!(".tvsorter-{unique}.partial");
+    match final_path.parent() {
+        Some(parent) => parent.join(name),
+        None => PathBuf::from(name),
+    }
+}
+
+/// Move a fully-written staging file onto `final_path`.
+///
+/// On Unix `rename` replaces the destination atomically, so a `replace` import
+/// never leaves the user without a file: the old one stays intact until the new
+/// one is complete. Windows `rename` refuses an existing destination, so there
+/// it falls back to remove-then-rename.
+fn promote_staged(staging: &Path, final_path: &Path) -> std::io::Result<()> {
+    match fs::rename(staging, final_path) {
+        Ok(()) => Ok(()),
+        Err(err) => {
+            if final_path.exists() {
+                fs::remove_file(final_path)?;
+                return fs::rename(staging, final_path);
+            }
+            Err(err)
+        }
     }
 }
 
@@ -757,6 +886,131 @@ mod tests {
         let record = result_to_record(&result, stat);
         assert_eq!(record.source_size, Some(11));
         assert!(record.source_mtime.is_some());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Re-importing an already-sorted library (the destination resolves back to
+    /// the source file itself) must never touch the file. Before the guard,
+    /// `replace` unlinked the source and every action then failed, destroying
+    /// the user's media.
+    #[test]
+    fn reimporting_a_file_onto_itself_leaves_it_untouched() {
+        for action in ["copy", "hardlink", "move"] {
+            for policy in ["skip", "replace", "index", "fail"] {
+                let dir = temp_dir();
+                let out = dir.join("out");
+
+                // Place the source exactly where the importer would put it.
+                let probe = request(dir.join("src.mkv"), out.clone(), action, policy);
+                let dest = build_destination(&probe);
+                fs::create_dir_all(dest.parent().unwrap()).unwrap();
+                File::create(&dest).unwrap().write_all(b"payload").unwrap();
+
+                let result =
+                    execute_import(request(dest.clone(), out, action, policy), None, None, None);
+
+                assert_eq!(
+                    result.result, "skipped",
+                    "action={action} policy={policy} should skip a self-import"
+                );
+                assert!(
+                    dest.exists(),
+                    "action={action} policy={policy} destroyed the source file"
+                );
+                assert_eq!(fs::read(&dest).unwrap(), b"payload");
+                fs::remove_dir_all(&dir).ok();
+            }
+        }
+    }
+
+    /// The preview must agree with what the import will actually do, otherwise
+    /// the UI promises an import that silently turns into a skip.
+    #[test]
+    fn preview_reports_a_self_import_as_skipped() {
+        let dir = temp_dir();
+        let out = dir.join("out");
+        let probe = request(dir.join("src.mkv"), out.clone(), "copy", "replace");
+        let dest = build_destination(&probe);
+        fs::create_dir_all(dest.parent().unwrap()).unwrap();
+        File::create(&dest).unwrap().write_all(b"payload").unwrap();
+
+        let result = preview_import(request(dest, out, "copy", "replace"));
+        assert_eq!(result.result, "skipped");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `replace` must not unlink the file already in the library until the new
+    /// one is complete. Previously the destination was removed up front, so a
+    /// copy that then failed left the user with neither file.
+    #[test]
+    fn failed_replace_leaves_the_existing_library_file_intact() {
+        let dir = temp_dir();
+        let out = dir.join("out");
+
+        // An existing, correctly-named library file.
+        let existing =
+            build_destination(&request(dir.join("x.mkv"), out.clone(), "copy", "replace"));
+        fs::create_dir_all(existing.parent().unwrap()).unwrap();
+        File::create(&existing)
+            .unwrap()
+            .write_all(b"ORIGINAL")
+            .unwrap();
+
+        // Import a source that does not exist: the copy fails partway.
+        let missing = dir.join("does-not-exist.mkv");
+        let result = execute_import(request(missing, out, "copy", "replace"), None, None, None);
+
+        assert_eq!(result.result, "failed");
+        assert!(
+            existing.exists(),
+            "replace destroyed the existing library file"
+        );
+        assert_eq!(fs::read(&existing).unwrap(), b"ORIGINAL");
+
+        // And no staging file is left lying around.
+        let leftovers: Vec<_> = fs::read_dir(existing.parent().unwrap())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.starts_with(".tvsorter-"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "left staging files behind: {leftovers:?}"
+        );
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A successful `replace` still swaps the file, and leaves no staging file.
+    #[test]
+    fn successful_replace_swaps_the_file_atomically() {
+        let dir = temp_dir();
+        let out = dir.join("out");
+        let source = dir.join("src.mkv");
+        File::create(&source)
+            .unwrap()
+            .write_all(b"NEW CONTENT")
+            .unwrap();
+
+        let existing = build_destination(&request(source.clone(), out.clone(), "copy", "replace"));
+        fs::create_dir_all(existing.parent().unwrap()).unwrap();
+        File::create(&existing).unwrap().write_all(b"OLD").unwrap();
+
+        let result = execute_import(request(source, out, "copy", "replace"), None, None, None);
+        assert_eq!(result.result, "imported");
+        assert_eq!(fs::read(&existing).unwrap(), b"NEW CONTENT");
+
+        let leftovers: Vec<_> = fs::read_dir(existing.parent().unwrap())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.starts_with(".tvsorter-"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "left staging files behind: {leftovers:?}"
+        );
         fs::remove_dir_all(&dir).ok();
     }
 }

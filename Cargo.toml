@@ -39,3 +39,8 @@ xattr = "1"
 [profile.release]
 opt-level = 2
 lto = "thin"
+# Debug symbols are dead weight in the shipped binary: the LXC builds from
+# source on the box itself and the desktop installers carry it over the wire.
+# `lto = "thin"` stays (rather than "fat" + codegen-units = 1) so the from-source
+# LXC build does not get appreciably slower.
+strip = true

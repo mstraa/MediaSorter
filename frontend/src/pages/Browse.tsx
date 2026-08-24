@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import { api, ApiError } from "../api";
 import { useImports } from "../components/ImportsContext";
@@ -45,16 +45,29 @@ export default function BrowsePage() {
   const [selectedStatus, setSelectedStatus] = useState("auto");
   const [loadError, setLoadError] = useState<string | null>(null);
 
+  // Folder loads are not cancellable, and on a network mount a slow folder can
+  // easily resolve after a folder the user picked later. Stamp each request and
+  // drop any response that is no longer the newest, so the listing always
+  // matches the path in the URL.
+  const requestSeq = useRef(0);
+
   const load = useCallback(() => {
+    const seq = ++requestSeq.current;
     progress.startDelayed("Loading folder...");
     api
       .getBrowse(rootId, path)
       .then((response) => {
+        if (seq !== requestSeq.current) return;
         setData(response);
         setLoadError(null);
       })
-      .catch((error) => setLoadError(error instanceof ApiError ? error.message : String(error)))
-      .finally(() => progress.hide());
+      .catch((error) => {
+        if (seq !== requestSeq.current) return;
+        setLoadError(error instanceof ApiError ? error.message : String(error));
+      })
+      .finally(() => {
+        if (seq === requestSeq.current) progress.hide();
+      });
   }, [rootId, path, progress]);
 
   useEffect(() => {

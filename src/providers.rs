@@ -60,6 +60,21 @@ impl ProviderError {
     }
 }
 
+/// Longest we will honour a `Retry-After`. Past this the request fails fast
+/// rather than holding a connection open on an upstream's say-so.
+const MAX_BACKOFF_SECS: f64 = 30.0;
+
+/// Turn an untrusted seconds value into a sane `Duration`.
+///
+/// `Duration::from_secs_f64` panics on negative, NaN, infinite, or overflowing
+/// input, so this never hands it one.
+fn clamp_backoff(secs: f64) -> Duration {
+    if !secs.is_finite() || secs <= 0.0 {
+        return Duration::from_secs(1);
+    }
+    Duration::from_secs_f64(secs.min(MAX_BACKOFF_SECS))
+}
+
 #[derive(Clone)]
 pub struct MetadataProviders {
     db: Database,
@@ -146,7 +161,11 @@ impl MetadataProviders {
                 .and_then(|v| v.to_str().ok())
                 .and_then(|v| v.parse::<f64>().ok())
                 .unwrap_or(2.0 * (attempt as f64 + 1.0));
-            tokio::time::sleep(Duration::from_secs_f64(retry_after)).await;
+            // `Duration::from_secs_f64` panics on a negative, NaN, infinite, or
+            // overflowing value, and this number comes straight off a remote
+            // response header. Clamp instead of trusting it — an upstream that
+            // asks us to wait an hour should not stall the request either.
+            tokio::time::sleep(clamp_backoff(retry_after)).await;
         }
         Err(ProviderError::Status(429))
     }

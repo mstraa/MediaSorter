@@ -134,6 +134,8 @@ export interface JobItem {
   status: string;
   bytes: number;
   total: number;
+  /** What bytes/total count: "bytes" (copy, move) or "items" (hardlink, test). */
+  unit: string;
   error: string | null;
 }
 
@@ -150,6 +152,8 @@ export interface JobSnapshot {
   failed_items: number;
   cancelled_items: number;
   active: boolean;
+  /** "bytes", "items", or "mixed" when the job combines both. */
+  unit: string;
   error: string | null;
   items: JobItem[];
 }

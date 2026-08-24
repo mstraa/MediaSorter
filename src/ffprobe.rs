@@ -1,5 +1,61 @@
+use std::io::Read;
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
+
+/// Wall-clock budget for one ffprobe invocation. A probe against a stalled
+/// network mount or a malformed file otherwise never returns, and each one
+/// holds a `spawn_blocking` thread for the lifetime of the process.
+const FFPROBE_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Run ffprobe with the given arguments, returning its stdout.
+///
+/// Returns `None` when ffprobe is missing, exits non-zero, or exceeds
+/// [`FFPROBE_TIMEOUT`] — in which case the child is killed and reaped so it
+/// does not linger. `path` is passed as a separate argument (never through a
+/// shell), and `-i` separates it from the option list so a filename that starts
+/// with `-` is not read as a flag.
+fn run_ffprobe(args: &[&str], path: &Path) -> Option<Vec<u8>> {
+    let mut child = Command::new("ffprobe")
+        .args(args)
+        .arg("-i")
+        .arg(path)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .stdin(Stdio::null())
+        .spawn()
+        .ok()?;
+
+    let deadline = Instant::now() + FFPROBE_TIMEOUT;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    tracing::warn!(
+                        "ffprobe timed out after {FFPROBE_TIMEOUT:?}: {}",
+                        path.display()
+                    );
+                    return None;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(_) => return None,
+        }
+    };
+
+    if !status.success() {
+        return None;
+    }
+
+    // Output here is a few bytes to a few KB, well under the pipe buffer, so
+    // reading after the child exits cannot deadlock.
+    let mut stdout = Vec::new();
+    child.stdout.as_mut()?.read_to_end(&mut stdout).ok()?;
+    Some(stdout)
+}
 
 /// Audio metadata read from a file's container/format tags via ffprobe.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -13,8 +69,8 @@ pub struct MusicTags {
 /// quality label. Returns `None` when ffprobe is unavailable or the height
 /// cannot be determined. This is the V1 "ffprobe resolution fallback" gap.
 pub fn probe_quality(path: &Path) -> Option<String> {
-    let output = Command::new("ffprobe")
-        .args([
+    let stdout = run_ffprobe(
+        &[
             "-v",
             "error",
             "-select_streams",
@@ -23,14 +79,10 @@ pub fn probe_quality(path: &Path) -> Option<String> {
             "stream=height",
             "-of",
             "default=noprint_wrappers=1:nokey=1",
-        ])
-        .arg(path)
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let text = String::from_utf8_lossy(&output.stdout);
+        ],
+        path,
+    )?;
+    let text = String::from_utf8_lossy(&stdout);
     let height: i64 = text.lines().next()?.trim().parse().ok()?;
     Some(quality_from_height(height))
 }
@@ -54,8 +106,8 @@ pub fn quality_from_height(height: i64) -> String {
 /// album, and year. Returns all-`None` fields when ffprobe is unavailable or
 /// the tags are absent. Never panics: every failure degrades to `None`.
 pub fn probe_music_tags(path: &Path) -> MusicTags {
-    let output = Command::new("ffprobe")
-        .args([
+    let stdout = run_ffprobe(
+        &[
             "-v",
             "error",
             "-show_entries",
@@ -64,14 +116,13 @@ pub fn probe_music_tags(path: &Path) -> MusicTags {
             "format_tags=artist,album,date,year,album_artist,ARTIST,ALBUM,DATE,YEAR,ALBUM_ARTIST",
             "-of",
             "json",
-        ])
-        .arg(path)
-        .output();
-    let output = match output {
-        Ok(output) if output.status.success() => output,
-        _ => return MusicTags::default(),
-    };
-    parse_music_tags_json(&String::from_utf8_lossy(&output.stdout))
+        ],
+        path,
+    );
+    match stdout {
+        Some(stdout) => parse_music_tags_json(&String::from_utf8_lossy(&stdout)),
+        None => MusicTags::default(),
+    }
 }
 
 /// Parse the ffprobe `-of json` output for `format_tags`. Split out so it can be

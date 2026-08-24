@@ -67,6 +67,20 @@ function matchEpisodeTitle(
   return null;
 }
 
+/// Parse the free-text year field.
+///
+/// `Number("abc")` is NaN, and `JSON.stringify` turns NaN into `null` — so an
+/// unparseable year used to vanish silently and drop the ` (year)` suffix from
+/// every destination path in the batch. Returning null explicitly keeps that
+/// from depending on a JSON quirk; the input below only accepts digits, so the
+/// value the user sees is the value that gets sent.
+function parseYear(value: string): number | null {
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+  const parsed = Number(trimmed);
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : null;
+}
+
 export default function MatchPage() {
   const location = useLocation();
   const navigate = useNavigate();
@@ -79,6 +93,7 @@ export default function MatchPage() {
   const [action, setAction] = useState("copy");
   const [conflict, setConflict] = useState("skip");
   const [error, setError] = useState<string | null>(null);
+  const [importing, setImporting] = useState(false);
   const loaded = useRef(false);
 
   useEffect(() => {
@@ -290,7 +305,7 @@ export default function MatchPage() {
           .map((ep) => ({
             source_path: ep.source_path,
             show_title: group.show_title,
-            show_year: group.show_year.trim() ? Number(group.show_year) : null,
+            show_year: parseYear(group.show_year),
             season_number: isFilm || isMusic ? 0 : ep.season_number,
             episode_number: isFilm || isMusic ? 0 : ep.episode_number,
             episode_title: isMusic ? group.album : isFilm ? "Film" : ep.episode_title,
@@ -304,11 +319,18 @@ export default function MatchPage() {
 
   // Import runs in the background: start the job and hand off to the Imports
   // page, so the user can keep browsing and matching while it runs.
+  //
+  // `importing` guards against a second click landing before the first request
+  // resolves. The backend appends to the active job, so a double-click would
+  // otherwise enqueue the whole batch twice and copy every file again.
   async function runImport() {
+    if (importing) return;
+    setImporting(true);
     try {
       await api.startImportJob(buildBatch());
     } catch (e) {
       alert(e instanceof ApiError ? e.message : "Could not start import.");
+      setImporting(false);
       return;
     }
     imports.refresh();
@@ -376,9 +398,9 @@ export default function MatchPage() {
             <button
               type="button"
               onClick={runImport}
-              disabled={!response?.output_root || includedCount === 0}
+              disabled={!response?.output_root || includedCount === 0 || importing}
             >
-              Import
+              {importing ? "Starting..." : "Import"}
             </button>
             {includedCount === 0 && episodeCount > 0 && (
               <span className="muted">Nothing selected to import.</span>
@@ -488,7 +510,10 @@ function GroupCard({
           <input
             className="group-year-input"
             value={group.show_year}
-            onChange={(e) => onUpdateGroup(gi, { show_year: e.target.value })}
+            inputMode="numeric"
+            onChange={(e) =>
+              onUpdateGroup(gi, { show_year: e.target.value.replace(/\D/g, "").slice(0, 4) })
+            }
             placeholder="Year"
           />
           {group.provider && <span className="provider-badge">{group.provider}</span>}
@@ -705,7 +730,10 @@ function MusicCard({
           <input
             className="group-year-input"
             value={group.show_year}
-            onChange={(e) => onUpdateGroup(gi, { show_year: e.target.value })}
+            inputMode="numeric"
+            onChange={(e) =>
+              onUpdateGroup(gi, { show_year: e.target.value.replace(/\D/g, "").slice(0, 4) })
+            }
             placeholder="Year"
           />
           <span className="muted group-count">
@@ -813,7 +841,10 @@ function FilmRow({
               Year
               <input
                 value={group.show_year}
-                onChange={(e) => onUpdateGroup(gi, { show_year: e.target.value })}
+                inputMode="numeric"
+                onChange={(e) =>
+                  onUpdateGroup(gi, { show_year: e.target.value.replace(/\D/g, "").slice(0, 4) })
+                }
               />
             </label>
             <label>
