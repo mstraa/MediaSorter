@@ -392,7 +392,10 @@ select option {
   color: var(--text);
 }
 
-.select-option:hover {
+/* `.active` is the keyboard-highlighted option (aria-activedescendant). Focus
+   stays on the button, so without this the arrow keys move nothing visible. */
+.select-option:hover,
+.select-option.active {
   background: var(--panel-2);
 }
 

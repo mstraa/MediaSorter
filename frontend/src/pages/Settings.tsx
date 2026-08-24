@@ -35,6 +35,7 @@ export default function SettingsPage() {
         setMusicRoot(settings.music_output_root);
         setCopyRate(settings.copy_rate_limit_mbps);
         setChecks(settings.checks);
+        setError(null);
       })
       .catch((e) => setError(e instanceof ApiError ? e.message : String(e)));
   }
@@ -43,6 +44,9 @@ export default function SettingsPage() {
 
   async function save() {
     setSaved(false);
+    // Clear any previous failure, otherwise a stale error banner renders
+    // alongside "Settings saved." once the retry succeeds.
+    setError(null);
     progress.startDelayed("Saving settings...");
     try {
       await api.saveSettings({
