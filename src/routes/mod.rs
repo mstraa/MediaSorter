@@ -188,7 +188,13 @@ async fn browse(
                 .await
                 .unwrap_or_else(|e| (Vec::new(), Some(e.to_string()), String::new()))
         }
-        None => (Vec::new(), None, String::new()),
+        // Distinguish "no input roots configured yet" (nothing to say) from
+        // "the requested root_id does not exist" — a stale bookmark or a root
+        // deleted in another tab otherwise renders as a silently empty folder.
+        None => {
+            let error = query.root_id.map(|id| format!("Input root {id} not found"));
+            (Vec::new(), error, String::new())
+        }
     };
 
     Json(BrowseResponse {
@@ -836,17 +842,25 @@ async fn preview(
     State(state): State<AppState>,
     Json(batch): Json<ImportBatch>,
 ) -> AppResult<Json<Value>> {
-    let requests = build_import_requests(&state, &batch)?;
-    let mut results = Vec::new();
-    for request in requests {
-        let result = preview_import(request);
-        results.push(json!({
-            "source_path": result.source_path,
-            "final_path": result.final_path,
-            "result": result.result,
-            "error": result.error,
-        }));
-    }
+    // Both building the requests and previewing them stat and canonicalize once
+    // per file, on media that usually lives on a network mount. A large batch
+    // would stall a Tokio worker for the whole walk, so do it off-runtime — the
+    // same treatment `browse` and `match_route` already get.
+    let results = blocking(move || {
+        let requests = build_import_requests(&state, &batch)?;
+        let mut results = Vec::new();
+        for request in requests {
+            let result = preview_import(request);
+            results.push(json!({
+                "source_path": result.source_path,
+                "final_path": result.final_path,
+                "result": result.result,
+                "error": result.error,
+            }));
+        }
+        Ok(results)
+    })
+    .await?;
     Ok(Json(json!({ "results": results })))
 }
 
@@ -854,10 +868,30 @@ async fn start_import_job(
     State(state): State<AppState>,
     Json(batch): Json<ImportBatch>,
 ) -> AppResult<Json<Value>> {
-    let requests = build_import_requests(&state, &batch)?;
-    let rate = state.copy_rate_limit_mbps();
-    let job = state.jobs.start(requests, state.db.clone(), rate);
-    Ok(Json(snapshot_json(&job)))
+    // Same reasoning as `preview`: request building stats every source, and
+    // `JobManager::start` stats each one again to size the progress bar.
+    let snapshot = blocking(move || {
+        let requests = build_import_requests(&state, &batch)?;
+        let rate = state.copy_rate_limit_mbps();
+        let job = state.jobs.start(requests, state.db.clone(), rate);
+        Ok(snapshot_json(&job))
+    })
+    .await?;
+    Ok(Json(snapshot))
+}
+
+/// Run a fallible, filesystem-heavy closure on the blocking pool.
+///
+/// A panic or a cancelled task surfaces as a 500 rather than taking the worker
+/// down silently.
+async fn blocking<T, F>(f: F) -> AppResult<T>
+where
+    F: FnOnce() -> AppResult<T> + Send + 'static,
+    T: Send + 'static,
+{
+    tokio::task::spawn_blocking(f)
+        .await
+        .map_err(|e| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
 }
 
 fn snapshot_json(job: &crate::jobs::Job) -> Value {

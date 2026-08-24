@@ -25,6 +25,7 @@ pub mod state;
 
 use std::net::SocketAddr;
 
+use axum::http::HeaderValue;
 use axum::Router;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::trace::TraceLayer;
@@ -45,6 +46,39 @@ pub fn init_tracing() {
         .init();
 }
 
+/// CORS policy for the API.
+///
+/// In production the SPA is embedded and served from this same origin, so no
+/// cross-origin access is needed at all. Only the Vite dev server (a different
+/// port) needs it, so the allow-list is limited to loopback dev origins.
+///
+/// This matters because the API is unauthenticated: with `allow_origin(Any)`,
+/// any page the user happens to visit could call `/api/folders` to enumerate
+/// the server's filesystem, or `/api/import-jobs` to move their media around.
+/// Set `TVSORTER_CORS_ORIGINS` (comma-separated) to allow additional origins,
+/// e.g. a Vite dev server running on another machine.
+fn cors_layer() -> CorsLayer {
+    let mut origins: Vec<HeaderValue> = ["http://127.0.0.1:5173", "http://localhost:5173"]
+        .iter()
+        .filter_map(|o| o.parse().ok())
+        .collect();
+
+    if let Ok(extra) = std::env::var("TVSORTER_CORS_ORIGINS") {
+        origins.extend(
+            extra
+                .split(',')
+                .map(str::trim)
+                .filter(|o| !o.is_empty())
+                .filter_map(|o| o.parse::<HeaderValue>().ok()),
+        );
+    }
+
+    CorsLayer::new()
+        .allow_origin(origins)
+        .allow_methods(Any)
+        .allow_headers(Any)
+}
+
 /// Build the fully-wired axum application (state, routes, CORS, tracing layer).
 pub fn build_app(config: AppConfig) -> Router {
     let db = Database::open(&config.database_path).expect("failed to open database");
@@ -56,14 +90,8 @@ pub fn build_app(config: AppConfig) -> Router {
         jobs: JobManager::new(),
     };
 
-    // Permissive CORS so the Vite dev server (port 5173) can call the API.
-    let cors = CorsLayer::new()
-        .allow_origin(Any)
-        .allow_methods(Any)
-        .allow_headers(Any);
-
     routes::build_router(state)
-        .layer(cors)
+        .layer(cors_layer())
         .layer(TraceLayer::new_for_http())
 }
 
