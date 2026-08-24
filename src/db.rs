@@ -7,6 +7,16 @@ use serde::Serialize;
 
 use crate::filesystem::canonical_or_normalized;
 
+/// Bound parameters per statement when building an `IN (...)` list. Well under
+/// SQLite's `SQLITE_MAX_VARIABLE_NUMBER` (999 on older builds, 32766 since
+/// 3.32) so a query over a large folder is chunked instead of failing outright.
+const SQL_MAX_PARAMS: usize = 500;
+
+/// How long a cached provider response stays valid. Short enough that episodes
+/// of an airing show show up the next day, long enough that re-matching the
+/// same batch does not re-hit the (rate-limited) provider APIs.
+const PROVIDER_CACHE_TTL_HOURS: i64 = 24;
+
 const SCHEMA: &str = r#"
 PRAGMA foreign_keys = ON;
 
@@ -69,10 +79,47 @@ CREATE TABLE IF NOT EXISTS source_status_overrides (
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
+"#;
+
+/// Index definitions, applied *after* the migrations.
+///
+/// The table-rebuild migrations do `ALTER TABLE imports RENAME TO
+/// imports_legacy; ... DROP TABLE imports_legacy`, and SQLite carries a table's
+/// indexes along with the rename — so the drop takes them with it. Creating
+/// indexes as part of `SCHEMA` alone would leave the process that performed the
+/// migration running unindexed until the next restart.
+const INDEXES: &str = r#"
 -- Browse looks imports up by source_path (exact-match IN lists and the
 -- per-source-latest GROUP BY); index it so those scale with the result set
 -- rather than the full table.
 CREATE INDEX IF NOT EXISTS idx_imports_source_path ON imports(source_path);
+
+-- The History page reads the newest imports first; without this the query
+-- sorts the whole table on every page load.
+CREATE INDEX IF NOT EXISTS idx_imports_recent ON imports(imported_at DESC, id DESC);
+
+-- Browse asks for the inodes this app hardlinked. Partial + covering: it
+-- indexes only the matching rows and holds the two columns the query reads,
+-- so the lookup never touches the table.
+CREATE INDEX IF NOT EXISTS idx_imports_hardlink_idents
+    ON imports(source_device, source_inode)
+    WHERE action = 'hardlink' AND result = 'imported';
+
+-- The library rescan reconciles rows per media_type.
+CREATE INDEX IF NOT EXISTS idx_library_files_media_type ON library_files(media_type);
+"#;
+
+/// Connection pragmas, applied on every open.
+///
+/// WAL keeps writes from rewriting a rollback journal (bulk status marking and
+/// import recording write many small rows), `synchronous = NORMAL` is the
+/// standard safe pairing with WAL, and `busy_timeout` makes a concurrent writer
+/// — a second instance, or a `sqlite3` session — wait rather than fail instantly.
+const PRAGMAS: &str = r#"
+PRAGMA journal_mode = WAL;
+PRAGMA synchronous = NORMAL;
+PRAGMA busy_timeout = 5000;
+PRAGMA foreign_keys = ON;
 "#;
 
 #[derive(Clone, Debug, Serialize)]
@@ -157,10 +204,14 @@ impl Database {
             let _ = std::fs::create_dir_all(parent);
         }
         let conn = Connection::open(path)?;
-        conn.execute_batch("PRAGMA foreign_keys = ON;")?;
+        // `journal_mode` returns a row, so this needs execute_batch's tolerance
+        // for result-producing statements rather than `execute`.
+        conn.execute_batch(PRAGMAS)?;
         conn.execute_batch(SCHEMA)?;
         migrate_imports_action_check(&conn)?;
         migrate_media_type_check(&conn)?;
+        // After the migrations: a table rebuild drops that table's indexes.
+        conn.execute_batch(INDEXES)?;
         Ok(Self {
             path: path.to_path_buf(),
             conn: Arc::new(Mutex::new(conn)),
@@ -295,7 +346,11 @@ impl Database {
             return -1;
         }
         let import_id = conn.last_insert_rowid();
-        if matches!(record.result.as_str(), "imported" | "preview" | "skipped") {
+        // "preview" is what the dry-run ("test") action reports: nothing was
+        // written, so it must not create a library row. It would land with
+        // present = 0 and show up on the Library page as a permanently missing
+        // file the user never actually imported, and nothing removes it.
+        if matches!(record.result.as_str(), "imported" | "skipped") {
             upsert_library_file(&conn, record, Some(import_id));
         }
         import_id
@@ -325,24 +380,31 @@ impl Database {
             .iter()
             .map(|p| canonical_or_normalized(p).to_string_lossy().to_string())
             .collect();
-        let placeholders = vec!["?"; normalized.len()].join(", ");
-        let sql = format!(
-            "SELECT * FROM imports WHERE id IN (
-                SELECT MAX(id) FROM imports WHERE source_path IN ({placeholders}) GROUP BY source_path
-            )"
-        );
         let conn = self.lock();
-        let mut stmt = match conn.prepare(&sql) {
-            Ok(stmt) => stmt,
-            Err(_) => return HashMap::new(),
-        };
-        let rows = stmt
-            .query_map(params_from_iter(normalized.iter()), map_import_row)
-            .map(|iter| iter.filter_map(Result::ok).collect::<Vec<_>>())
-            .unwrap_or_default();
-        rows.into_iter()
-            .map(|row| (row.source_path.clone(), row))
-            .collect()
+        let mut out = HashMap::new();
+        // Chunked: one bound parameter per path would blow SQLITE_MAX_VARIABLE_NUMBER
+        // on a large folder, and `prepare` would then fail for the whole batch.
+        for chunk in normalized.chunks(SQL_MAX_PARAMS) {
+            let placeholders = vec!["?"; chunk.len()].join(", ");
+            let sql = format!(
+                "SELECT * FROM imports WHERE id IN (
+                    SELECT MAX(id) FROM imports WHERE source_path IN ({placeholders}) GROUP BY source_path
+                )"
+            );
+            let mut stmt = match conn.prepare(&sql) {
+                Ok(stmt) => stmt,
+                Err(e) => {
+                    tracing::warn!("latest_imports_for_sources prepare failed: {e}");
+                    continue;
+                }
+            };
+            let rows = stmt
+                .query_map(params_from_iter(chunk.iter()), map_import_row)
+                .map(|iter| iter.filter_map(Result::ok).collect::<Vec<_>>())
+                .unwrap_or_default();
+            out.extend(rows.into_iter().map(|row| (row.source_path.clone(), row)));
+        }
+        out
     }
 
     /// Latest import row for every source whose path lies under `prefix` (a
@@ -401,27 +463,33 @@ impl Database {
             .iter()
             .map(|p| canonical_or_normalized(p).to_string_lossy().to_string())
             .collect();
-        let placeholders = vec!["?"; normalized.len()].join(", ");
-        let sql = format!(
-            "SELECT source_path, status FROM source_status_overrides WHERE source_path IN ({placeholders})"
-        );
         let conn = self.lock();
-        let mut stmt = match conn.prepare(&sql) {
-            Ok(stmt) => stmt,
-            Err(_) => return HashMap::new(),
-        };
-        let rows = stmt
-            .query_map(params_from_iter(normalized.iter()), |row| {
-                Ok(SourceStatusOverride {
-                    source_path: row.get(0)?,
-                    status: row.get(1)?,
+        let mut out = HashMap::new();
+        // Chunked for the same reason as `latest_imports_for_sources`.
+        for chunk in normalized.chunks(SQL_MAX_PARAMS) {
+            let placeholders = vec!["?"; chunk.len()].join(", ");
+            let sql = format!(
+                "SELECT source_path, status FROM source_status_overrides WHERE source_path IN ({placeholders})"
+            );
+            let mut stmt = match conn.prepare(&sql) {
+                Ok(stmt) => stmt,
+                Err(e) => {
+                    tracing::warn!("source_status_overrides prepare failed: {e}");
+                    continue;
+                }
+            };
+            let rows = stmt
+                .query_map(params_from_iter(chunk.iter()), |row| {
+                    Ok(SourceStatusOverride {
+                        source_path: row.get(0)?,
+                        status: row.get(1)?,
+                    })
                 })
-            })
-            .map(|iter| iter.filter_map(Result::ok).collect::<Vec<_>>())
-            .unwrap_or_default();
-        rows.into_iter()
-            .map(|row| (row.source_path.clone(), row))
-            .collect()
+                .map(|iter| iter.filter_map(Result::ok).collect::<Vec<_>>())
+                .unwrap_or_default();
+            out.extend(rows.into_iter().map(|row| (row.source_path.clone(), row)));
+        }
+        out
     }
 
     pub fn set_source_status_overrides(&self, source_paths: &[PathBuf], status: Option<&str>) {
@@ -432,11 +500,21 @@ impl Database {
         if normalized.is_empty() {
             return;
         }
-        let conn = self.lock();
+        // One transaction for the whole batch. Marking a large folder writes one
+        // row per file; without this each row is its own implicit transaction
+        // and pays a separate fsync, which turns a bulk mark into minutes of IO.
+        let mut conn = self.lock();
+        let tx = match conn.transaction() {
+            Ok(tx) => tx,
+            Err(e) => {
+                tracing::warn!("set_source_status_overrides transaction failed: {e}");
+                return;
+            }
+        };
         match status {
             None => {
                 for path in &normalized {
-                    let _ = conn.execute(
+                    let _ = tx.execute(
                         "DELETE FROM source_status_overrides WHERE source_path = ?1",
                         params![path],
                     );
@@ -444,7 +522,7 @@ impl Database {
             }
             Some(status) => {
                 for path in &normalized {
-                    let _ = conn.execute(
+                    let _ = tx.execute(
                         "INSERT INTO source_status_overrides (source_path, status) VALUES (?1, ?2)
                          ON CONFLICT(source_path) DO UPDATE SET status = excluded.status, updated_at = CURRENT_TIMESTAMP",
                         params![path, status],
@@ -452,6 +530,7 @@ impl Database {
                 }
             }
         }
+        let _ = tx.commit();
     }
 
     // ---- library files ----
@@ -507,21 +586,37 @@ impl Database {
 
     pub fn mark_missing_outside(&self, roots: &HashMap<String, PathBuf>) {
         let rows = self.list_library_files();
+
+        // Decide which rows are missing BEFORE taking the connection lock.
+        // `is_relative_to` canonicalizes both paths and `exists` stats — three
+        // syscalls per file. Doing that under the lock (and inside an open write
+        // transaction) stalls every other request on a large library, and the
+        // media usually lives on a network mount where each call is a round trip.
+        let missing: Vec<i64> = rows
+            .into_iter()
+            .filter(|row| {
+                roots.get(&row.media_type).is_some_and(|root| {
+                    let path = PathBuf::from(&row.output_path);
+                    crate::filesystem::is_relative_to(&path, root) && !path.exists()
+                })
+            })
+            .map(|row| row.id)
+            .collect();
+
+        if missing.is_empty() {
+            return;
+        }
+
         let mut conn = self.lock();
         let tx = match conn.transaction() {
             Ok(tx) => tx,
             Err(_) => return,
         };
-        for row in rows {
-            let path = PathBuf::from(&row.output_path);
-            if let Some(root) = roots.get(&row.media_type) {
-                if crate::filesystem::is_relative_to(&path, root) && !path.exists() {
-                    let _ = tx.execute(
-                        "UPDATE library_files SET present = 0, updated_at = CURRENT_TIMESTAMP WHERE id = ?1",
-                        params![row.id],
-                    );
-                }
-            }
+        for id in missing {
+            let _ = tx.execute(
+                "UPDATE library_files SET present = 0, updated_at = CURRENT_TIMESTAMP WHERE id = ?1",
+                params![id],
+            );
         }
         let _ = tx.commit();
     }
@@ -530,16 +625,30 @@ impl Database {
 
     pub fn get_cache(&self, key: &str) -> Option<serde_json::Value> {
         let conn = self.lock();
+        // Entries expire: an airing show gains episodes, and a permanently
+        // cached episode list means newly aired ones never appear in the match
+        // queue. `created_at` is stored as a UTC `CURRENT_TIMESTAMP` string, so
+        // let SQLite do the age comparison.
         let text: Option<String> = conn
             .query_row(
-                "SELECT value FROM provider_cache WHERE key = ?1",
-                params![key],
+                "SELECT value FROM provider_cache
+                 WHERE key = ?1 AND created_at > datetime('now', ?2)",
+                params![key, format!("-{PROVIDER_CACHE_TTL_HOURS} hours")],
                 |row| row.get(0),
             )
             .optional()
             .ok()
             .flatten();
         text.and_then(|t| serde_json::from_str(&t).ok())
+    }
+
+    /// Drop cache entries past their TTL. Called opportunistically on write so
+    /// the table does not grow without bound across a long-lived deployment.
+    fn purge_expired_cache(conn: &Connection) {
+        let _ = conn.execute(
+            "DELETE FROM provider_cache WHERE created_at <= datetime('now', ?1)",
+            params![format!("-{PROVIDER_CACHE_TTL_HOURS} hours")],
+        );
     }
 
     pub fn set_cache(&self, key: &str, value: &serde_json::Value) {
@@ -553,6 +662,7 @@ impl Database {
              ON CONFLICT(key) DO UPDATE SET value = excluded.value, created_at = CURRENT_TIMESTAMP",
             params![key, serialized],
         );
+        Self::purge_expired_cache(&conn);
     }
 }
 
@@ -934,6 +1044,84 @@ VALUES ('tv', '/out/a.mkv', 1);
             .unwrap();
         assert_eq!(music_rows, 1);
         drop(conn);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Browsing a folder that expands to more source files than SQLite allows
+    /// bound parameters must still resolve every status. Before chunking, the
+    /// whole `prepare` failed and every file silently showed as "no status".
+    #[test]
+    fn source_lookups_chunk_past_the_sqlite_parameter_limit() {
+        let dir = std::env::temp_dir().join(format!("tvsorter-db-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = Database::open(&dir.join("test.db")).unwrap();
+        let base = canonical_or_normalized(&dir);
+
+        let tracked = base.join("tracked.mkv");
+        db.insert_import(&record(&tracked.to_string_lossy()));
+        db.set_source_status_overrides(std::slice::from_ref(&tracked), Some("skipped"));
+
+        // Far beyond SQLITE_MAX_VARIABLE_NUMBER (32766 on modern builds).
+        let mut paths: Vec<PathBuf> = (0..40_000)
+            .map(|i| base.join(format!("f{i}.mkv")))
+            .collect();
+        paths.push(tracked.clone());
+
+        let imports = db.latest_imports_for_sources(&paths);
+        assert!(imports.contains_key(tracked.to_string_lossy().as_ref()));
+
+        let overrides = db.source_status_overrides(&paths);
+        assert_eq!(
+            overrides
+                .get(tracked.to_string_lossy().as_ref())
+                .map(|o| o.status.as_str()),
+            Some("skipped")
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A cached provider response must expire, otherwise an airing show's
+    /// episode list is frozen at whatever it held the first time it was fetched
+    /// and newly aired episodes never reach the match queue.
+    #[test]
+    fn provider_cache_entries_expire() {
+        let dir = std::env::temp_dir().join(format!("tvsorter-db-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = Database::open(&dir.join("test.db")).unwrap();
+
+        db.set_cache("tvmaze:episodes:1", &serde_json::json!({"episodes": 10}));
+        assert!(
+            db.get_cache("tvmaze:episodes:1").is_some(),
+            "fresh entry should hit"
+        );
+
+        // Backdate past the TTL.
+        {
+            let conn = db.lock();
+            conn.execute(
+                "UPDATE provider_cache SET created_at = datetime('now', ?1) WHERE key = ?2",
+                params![
+                    format!("-{} hours", PROVIDER_CACHE_TTL_HOURS + 1),
+                    "tvmaze:episodes:1"
+                ],
+            )
+            .unwrap();
+        }
+        assert!(
+            db.get_cache("tvmaze:episodes:1").is_none(),
+            "stale entry must miss"
+        );
+
+        // And the next write sweeps it out rather than letting the table grow.
+        db.set_cache("tvmaze:episodes:2", &serde_json::json!({"episodes": 1}));
+        let remaining: i64 = {
+            let conn = db.lock();
+            conn.query_row("SELECT COUNT(*) FROM provider_cache", [], |r| r.get(0))
+                .unwrap()
+        };
+        assert_eq!(remaining, 1);
+
         std::fs::remove_dir_all(&dir).ok();
     }
 }
