@@ -29,7 +29,10 @@ structure.
 
 ## Non-Goals
 
-- No automatic deletion, moving, or renaming of source files.
+- No automatic deletion, moving, or renaming of source files. *(Superseded: a
+  `move` action shipped after the MVP. It is opt-in per import — the default is
+  still `copy`, which leaves sources untouched — and it is the only action that
+  removes a source file.)*
 - No user login or authentication in the MVP.
 - No subtitle import in the MVP.
 - No automatic daemon-style watch/import workflow in the MVP.

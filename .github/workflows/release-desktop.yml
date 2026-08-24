@@ -56,7 +56,10 @@ jobs:
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
-          node-version: lts/*
+          # Pinned to a major rather than `lts/*`: this job has contents:write
+          # and publishes installers, so the toolchain must not shift under it
+          # when a new LTS lands. Matches the version CI builds with.
+          node-version: "20"
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable

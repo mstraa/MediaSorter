@@ -40,7 +40,7 @@ src/
   library.rs     output rescan
   assets.rs      embedded SPA serving + fallback
   routes/mod.rs  all HTTP handlers + router
-frontend/        React + TS SPA (pages: Browse, Match, Results, Library, History, Settings)
+frontend/        React + TS SPA (pages: Browse, Match, Results, Imports, History, Settings)
 src-tauri/       desktop app (Tauri) — embeds the server via tvsorter::spawn_embedded
 scripts/         create-proxmox-lxc.sh, update-tvsorter.sh, tvsorter-access.sh, build-app.sh, build-desktop.sh
 ```
