@@ -141,24 +141,28 @@ pub fn list_directory(root: &Path, relative_path: &str) -> Result<Vec<BrowserEnt
     }
     let root_c = canonical_or_normalized(root);
     let read = fs::read_dir(&directory).map_err(|e| FsError::Io(e.to_string()))?;
-    let mut children: Vec<PathBuf> = read
-        .filter_map(|entry| entry.ok().map(|e| e.path()))
+
+    // Stat each child exactly once and precompute the sort key. Sorting on
+    // `Path::is_dir()` / `name_lower()` instead would re-stat and re-allocate
+    // inside the comparator — O(n log n) syscalls over a directory that may sit
+    // on a network mount, versus O(n) here.
+    let mut children: Vec<(bool, String, PathBuf, fs::Metadata)> = read
+        .filter_map(|entry| entry.ok())
+        .filter_map(|entry| {
+            let path = entry.path();
+            // `metadata` (not `entry.file_type()`) so symlinks resolve, matching
+            // how the entries are classified below.
+            let meta = fs::metadata(&path).ok()?;
+            Some((meta.is_dir(), name_lower(&path), path, meta))
+        })
         .collect();
-    children.sort_by(|a, b| {
-        let a_dir = a.is_dir();
-        let b_dir = b.is_dir();
-        // Folders first, then case-insensitive name.
-        (!a_dir)
-            .cmp(&!b_dir)
-            .then_with(|| name_lower(a).cmp(&name_lower(b)))
+    // Folders first, then case-insensitive name.
+    children.sort_by(|(a_dir, a_name, _, _), (b_dir, b_name, _, _)| {
+        (!a_dir).cmp(&!b_dir).then_with(|| a_name.cmp(b_name))
     });
 
-    let mut entries = Vec::new();
-    for child in children {
-        let metadata = match fs::metadata(&child) {
-            Ok(meta) => meta,
-            Err(_) => continue,
-        };
+    let mut entries = Vec::with_capacity(children.len());
+    for (_, _, child, metadata) in children {
         let child_c = canonical_or_normalized(&child);
         let relative = match child_c.strip_prefix(&root_c) {
             Ok(rel) => rel.to_string_lossy().to_string(),
@@ -201,11 +205,29 @@ pub fn collect_files(dir: &Path, keep: &dyn Fn(&Path) -> bool, out: &mut Vec<Pat
     };
     for entry in read.flatten() {
         let path = entry.path();
-        if path.is_dir() {
+        if is_dir_entry(&entry, &path) {
             collect_files(&path, keep, out);
         } else if keep(&path) {
             out.push(path);
         }
+    }
+}
+
+/// Whether a directory entry is (or points at) a directory.
+///
+/// `readdir` already reports the type on Linux and macOS, so the common case
+/// costs nothing; only a symlink needs an explicit stat to resolve. Calling
+/// `Path::is_dir()` instead would stat every single entry, and this runs over
+/// the whole tree under each Browse row.
+fn is_dir_entry(entry: &fs::DirEntry, path: &Path) -> bool {
+    match entry.file_type() {
+        // Resolve symlinks so a symlinked show folder is still walked, matching
+        // the previous `Path::is_dir()` behaviour.
+        Ok(file_type) if file_type.is_symlink() => {
+            fs::metadata(path).map(|m| m.is_dir()).unwrap_or(false)
+        }
+        Ok(file_type) => file_type.is_dir(),
+        Err(_) => path.is_dir(),
     }
 }
 
@@ -216,6 +238,7 @@ fn expand_files(
 ) -> Result<Vec<PathBuf>, FsError> {
     let mut files: Vec<PathBuf> = Vec::new();
     let mut seen: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+    let root_c = canonical_or_normalized(root);
     for relative_path in relative_paths {
         let target = resolve_under_root(root, relative_path)?;
         let mut candidates: Vec<PathBuf> = Vec::new();
@@ -227,6 +250,14 @@ fn expand_files(
         for candidate in candidates {
             if candidate.is_file() && (!video_only || is_video_file(&candidate)) {
                 let resolved = canonical_or_normalized(&candidate);
+                // A symlink inside the root can point outside it. Browse already
+                // hides those (their canonical path will not strip_prefix the
+                // root) and the import handler rejects them, so expanding them
+                // here only produced a confusing whole-batch failure — and
+                // following them would otherwise reach outside the input root.
+                if !resolved.starts_with(&root_c) {
+                    continue;
+                }
                 if seen.insert(resolved.clone()) {
                     files.push(resolved);
                 }
@@ -454,5 +485,53 @@ mod tests {
             .iter()
             .any(|s| s.eq_ignore_ascii_case("Season 1")));
         fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A symlink inside an input root can point outside it. Expansion must not
+    /// follow it out: Browse already hides such entries and the import handler
+    /// rejects them, so following it only produced a confusing whole-batch
+    /// failure — and it would otherwise reach outside the configured root.
+    #[test]
+    #[cfg(unix)]
+    fn expansion_does_not_follow_symlinks_out_of_the_root() {
+        let base = std::env::temp_dir().join(format!("tvsorter-sym-{}", uuid::Uuid::new_v4()));
+        let root = base.join("root");
+        let outside = base.join("outside");
+        fs::create_dir_all(root.join("inside")).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        File::create(root.join("inside/a.mkv")).unwrap();
+        File::create(outside.join("secret.mkv")).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("escaping")).unwrap();
+
+        let files = expand_source_files(&root, &["".to_string()]).unwrap();
+        assert!(
+            files.iter().any(|p| p.ends_with("a.mkv")),
+            "files genuinely inside the root must still be found"
+        );
+        assert!(
+            !files.iter().any(|p| p.ends_with("secret.mkv")),
+            "expansion escaped the input root through a symlink: {files:?}"
+        );
+
+        fs::remove_dir_all(&base).ok();
+    }
+
+    /// A symlinked directory that stays inside the root is still walked — that
+    /// is a normal way to lay out a media library.
+    #[test]
+    #[cfg(unix)]
+    fn expansion_follows_symlinks_that_stay_inside_the_root() {
+        let root = std::env::temp_dir().join(format!("tvsorter-sym-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(root.join("real/Season 2")).unwrap();
+        File::create(root.join("real/Season 2/ep.mkv")).unwrap();
+        std::os::unix::fs::symlink(root.join("real"), root.join("linked")).unwrap();
+
+        let files = expand_source_files(&root, &["".to_string()]).unwrap();
+        assert!(
+            files.iter().any(|p| p.ends_with("ep.mkv")),
+            "in-root symlinked folder should still be walked: {files:?}"
+        );
+
+        fs::remove_dir_all(&root).ok();
     }
 }

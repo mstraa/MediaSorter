@@ -22,7 +22,21 @@ pub struct JobItem {
     pub status: String,
     pub bytes: u64,
     pub total: u64,
+    /// What `bytes`/`total` count: "bytes" for copy/move, "items" for hardlink
+    /// and test, which complete instantly and are measured as 1 unit each. The
+    /// UI needs this to avoid rendering an item count as a file size.
+    pub unit: &'static str,
     pub error: Option<String>,
+}
+
+/// Progress unit for an action: copies and moves stream bytes, hardlinks and
+/// dry runs are instantaneous and counted as whole items.
+fn unit_for(action: &str) -> &'static str {
+    if action == "copy" || action == "move" {
+        "bytes"
+    } else {
+        "items"
+    }
 }
 
 #[derive(Default)]
@@ -63,6 +77,9 @@ pub struct JobSnapshot {
     pub failed_items: usize,
     pub cancelled_items: usize,
     pub active: bool,
+    /// Aggregate unit over every item: "bytes", "items", or "mixed" when the
+    /// job combines both and the totals cannot be rendered as one quantity.
+    pub unit: &'static str,
     pub error: Option<String>,
     pub items: Vec<JobItem>,
 }
@@ -85,7 +102,25 @@ fn build_item(index: usize, request: &ImportRequest) -> JobItem {
         status: "queued".to_string(),
         bytes: 0,
         total: import_request_units(request),
+        unit: unit_for(&request.action),
         error: None,
+    }
+}
+
+/// The unit shared by every item, or "mixed" when a job combines byte-measured
+/// copies with item-counted hardlinks — in that case the summed totals are not
+/// one quantity and the UI renders them as plain numbers.
+fn aggregate_unit(items: &[JobItem]) -> &'static str {
+    let mut iter = items.iter();
+    match iter.next() {
+        None => "items",
+        Some(first) => {
+            if iter.all(|item| item.unit == first.unit) {
+                first.unit
+            } else {
+                "mixed"
+            }
+        }
     }
 }
 
@@ -137,6 +172,7 @@ impl Job {
             failed_items,
             cancelled_items,
             active: s.state == "running",
+            unit: aggregate_unit(&s.items),
             error: s.error.clone(),
             items: s.items.clone(),
         }
@@ -166,7 +202,11 @@ impl Job {
     /// false if the job is no longer running, so the caller starts a fresh job.
     fn try_append(&self, requests: &[ImportRequest]) -> bool {
         let mut s = self.lock();
-        if s.state != "running" {
+        // `cancel_all` is set while the state is still "running" — the worker
+        // only flips it once it has drained the queue. Appending in that window
+        // would hand the new files straight to the cancel check and silently
+        // cancel them, so refuse and let the caller open a fresh job.
+        if s.state != "running" || s.cancel_all {
             return false;
         }
         for request in requests {
@@ -214,6 +254,31 @@ impl Job {
             s.cancel_items.insert(index);
         }
     }
+}
+
+/// How many finished jobs to keep once a new one starts.
+///
+/// "Clear finished" only drops jobs that completed cleanly, so a job with a
+/// single failed file used to live for the lifetime of the process — and every
+/// 1s poll re-serialized its whole item list. Active jobs are never pruned.
+const MAX_FINISHED_JOBS: usize = 20;
+
+/// Drop the oldest finished jobs past [`MAX_FINISHED_JOBS`], newest kept.
+fn prune_finished(jobs: &mut Vec<Arc<Job>>) {
+    let finished: usize = jobs.iter().filter(|job| job.is_finished()).count();
+    if finished <= MAX_FINISHED_JOBS {
+        return;
+    }
+    let mut to_drop = finished - MAX_FINISHED_JOBS;
+    // `jobs` is push-ordered, so the oldest are at the front.
+    jobs.retain(|job| {
+        if to_drop > 0 && job.is_finished() {
+            to_drop -= 1;
+            false
+        } else {
+            true
+        }
+    });
 }
 
 #[derive(Clone, Default)]
@@ -298,6 +363,7 @@ impl JobManager {
             })),
         });
         guard.push(job.clone());
+        prune_finished(&mut guard);
         drop(guard);
 
         let worker_state = job.state.clone();
@@ -419,5 +485,61 @@ fn run_job(state: Arc<Mutex<JobState>>, db: Database, copy_rate_limit_mbps: Opti
         }
 
         index += 1;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn finished_job(seq: u64, state: &str) -> Arc<Job> {
+        Arc::new(Job {
+            id: format!("job{seq}"),
+            seq,
+            state: Arc::new(Mutex::new(JobState {
+                state: state.to_string(),
+                ..Default::default()
+            })),
+        })
+    }
+
+    #[test]
+    fn prune_keeps_active_jobs_and_the_newest_finished_ones() {
+        // Oldest first, as `start` pushes them.
+        let mut jobs: Vec<Arc<Job>> = (0..MAX_FINISHED_JOBS as u64 + 5)
+            .map(|seq| finished_job(seq, "failed"))
+            .collect();
+        // An active job interleaved partway through must survive regardless.
+        jobs.insert(2, finished_job(999, "running"));
+
+        prune_finished(&mut jobs);
+
+        let finished: Vec<u64> = jobs
+            .iter()
+            .filter(|j| j.is_finished())
+            .map(|j| j.seq)
+            .collect();
+        assert_eq!(finished.len(), MAX_FINISHED_JOBS);
+        // The five oldest finished jobs were dropped, newest kept.
+        assert_eq!(finished.first(), Some(&5));
+        assert!(
+            jobs.iter().any(|j| j.seq == 999 && !j.is_finished()),
+            "an active job must never be pruned"
+        );
+    }
+
+    #[test]
+    fn prune_is_a_noop_below_the_cap() {
+        let mut jobs: Vec<Arc<Job>> = (0..3).map(|seq| finished_job(seq, "done")).collect();
+        prune_finished(&mut jobs);
+        assert_eq!(jobs.len(), 3);
+    }
+
+    #[test]
+    fn progress_unit_follows_the_action() {
+        assert_eq!(unit_for("copy"), "bytes");
+        assert_eq!(unit_for("move"), "bytes");
+        assert_eq!(unit_for("hardlink"), "items");
+        assert_eq!(unit_for("test"), "items");
     }
 }
