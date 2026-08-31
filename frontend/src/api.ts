@@ -110,8 +110,9 @@ export const api = {
     return request<{ results: ShowCandidate[] }>(`/api/search?${params.toString()}`);
   },
 
-  episodes: (mediaType: MediaType, providerShowId: string) => {
+  episodes: (mediaType: MediaType, providerShowId: string, provider?: string) => {
     const params = new URLSearchParams({ media_type: mediaType, provider_show_id: providerShowId });
+    if (provider) params.set("provider", provider);
     return request<{ results: EpisodeCandidate[] }>(`/api/episodes?${params.toString()}`);
   },
 
