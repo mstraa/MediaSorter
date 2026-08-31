@@ -174,6 +174,10 @@ pub struct SearchQuery {
 pub struct EpisodesQuery {
     pub media_type: String,
     pub provider_show_id: String,
+    /// Provider the show was matched against. Optional for older clients;
+    /// when absent the media type decides which endpoint to hit.
+    #[serde(default)]
+    pub provider: Option<String>,
 }
 
 // ---- Folders ----

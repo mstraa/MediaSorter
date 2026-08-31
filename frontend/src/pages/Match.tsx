@@ -60,7 +60,9 @@ function matchEpisodeTitle(
 ): string | null {
   const exact = episodes.find((e) => e.season === season && e.episode === episode);
   if (exact) return exact.title;
-  if (isAnime) {
+  // Jikan lists one flat season per MAL entry, so absolute numbering is all
+  // there is. An anime matched on TVMaze has real seasons — don't guess there.
+  if (isAnime && episodes[0]?.provider === "jikan") {
     const byNumber = episodes.find((e) => e.episode === episode);
     if (byNumber) return byNumber.title;
   }
@@ -239,7 +241,7 @@ export default function MatchPage() {
 
     progress.startDelayed("Loading episodes...");
     try {
-      const { results } = await api.episodes(mediaType, candidate.provider_id);
+      const { results } = await api.episodes(mediaType, candidate.provider_id, candidate.provider);
       setGroups((prev) =>
         prev.map((group, i) => {
           if (i !== gi) return group;
@@ -276,14 +278,14 @@ export default function MatchPage() {
   }
 
   async function loadGroupEpisodes(gi: number) {
-    const providerShowId = groups[gi].provider_show_id;
+    const { provider_show_id: providerShowId, provider } = groups[gi];
     if (!providerShowId) {
       updateGroup(gi, { searchStatus: "Match a show first to load episodes." });
       return;
     }
     progress.startDelayed("Loading episodes...");
     try {
-      const { results } = await api.episodes(mediaType, providerShowId);
+      const { results } = await api.episodes(mediaType, providerShowId, provider);
       updateGroup(gi, { episodeOptions: results });
     } catch (e) {
       updateGroup(gi, {

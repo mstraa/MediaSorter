@@ -713,12 +713,15 @@ async fn enrich_group(
     // One episode fetch for the selected show.
     let episodes = match &selected {
         Some(candidate) => {
-            let key = format!("{}:{}", media_type, candidate.provider_id);
+            let key = format!(
+                "{}:{}:{}",
+                media_type, candidate.provider, candidate.provider_id
+            );
             match episode_cache.get(&key) {
                 Some(cached) => cached.clone(),
                 None => match state
                     .providers
-                    .episodes(media_type, &candidate.provider_id)
+                    .episodes_for(&candidate.provider, media_type, &candidate.provider_id)
                     .await
                 {
                     Ok(found) => {
@@ -749,7 +752,10 @@ async fn enrich_group(
             .iter()
             .find(|e| e.season == parsed.season && e.episode == parsed.episode)
             .or_else(|| {
-                if media_type == "anime" {
+                // Jikan returns a single flat season per MAL entry, so an
+                // absolute episode number is the only thing to match on.
+                // TVMaze data has real seasons — don't guess there.
+                if episodes.first().is_some_and(|e| e.provider == "jikan") {
                     episodes.iter().find(|e| e.episode == parsed.episode)
                 } else {
                     None
@@ -1131,7 +1137,11 @@ async fn episodes(
     }
     let results = state
         .providers
-        .episodes(&query.media_type, &query.provider_show_id)
+        .episodes_for(
+            query.provider.as_deref().unwrap_or(""),
+            &query.media_type,
+            &query.provider_show_id,
+        )
         .await
         .map_err(|e| AppError::new(StatusCode::BAD_GATEWAY, e.user_message()))?;
     Ok(Json(json!({ "results": results })))

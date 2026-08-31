@@ -55,9 +55,20 @@ impl ProviderError {
                 "Metadata provider refused the request. Filename parsing was used for this item."
                     .to_string()
             }
+            ProviderError::Status(code) if (500..600).contains(code) => {
+                "Metadata provider is temporarily unavailable. Filename parsing was used for this item."
+                    .to_string()
+            }
             other => other.to_string(),
         }
     }
+}
+
+/// Statuses worth another attempt: the upstream is busy or its own backend
+/// timed out, neither of which says anything about the request itself.
+/// Jikan in particular answers 504 whenever MyAnimeList is unreachable.
+fn is_retriable(status: u16) -> bool {
+    matches!(status, 408 | 425 | 429 | 500 | 502 | 503 | 504)
 }
 
 /// Longest we will honour a `Retry-After`. Past this the request fails fast
@@ -103,11 +114,29 @@ impl MetadataProviders {
     ) -> Result<Vec<ShowCandidate>, ProviderError> {
         match media_type {
             "tv" => self.search_tvmaze(query).await,
-            "anime" => self.search_jikan(query).await,
+            "anime" => self.search_anime(query).await,
             "film" => self.search_films(query).await,
             other => Err(ProviderError::Other(format!(
                 "Unsupported media type: {other}"
             ))),
+        }
+    }
+
+    /// Fetch episodes from the provider the show was actually matched against.
+    ///
+    /// An anime folder can be matched on TVMaze when Jikan is down, so the
+    /// media type alone is not enough to pick the right episode endpoint.
+    pub async fn episodes_for(
+        &self,
+        provider: &str,
+        media_type: &str,
+        provider_show_id: &str,
+    ) -> Result<Vec<EpisodeCandidate>, ProviderError> {
+        match provider {
+            "tvmaze" => self.tvmaze_episodes(provider_show_id).await,
+            "jikan" => self.jikan_episodes(provider_show_id).await,
+            "imdb" | "wikidata" => Ok(Vec::new()),
+            _ => self.episodes(media_type, provider_show_id).await,
         }
     }
 
@@ -136,6 +165,7 @@ impl MetadataProviders {
     }
 
     async fn get_json(&self, url: &str) -> Result<Value, ProviderError> {
+        let mut last_status = 429u16;
         for attempt in 0..3 {
             let response = self
                 .client
@@ -146,15 +176,17 @@ impl MetadataProviders {
                 .await
                 .map_err(|e| ProviderError::Http(e.to_string()))?;
             let status = response.status();
-            if status.as_u16() != 429 {
+            let code = status.as_u16();
+            if !is_retriable(code) {
                 if !status.is_success() {
-                    return Err(ProviderError::Status(status.as_u16()));
+                    return Err(ProviderError::Status(code));
                 }
                 return response
                     .json::<Value>()
                     .await
                     .map_err(|e| ProviderError::Http(e.to_string()));
             }
+            last_status = code;
             let retry_after = response
                 .headers()
                 .get("Retry-After")
@@ -167,7 +199,7 @@ impl MetadataProviders {
             // asks us to wait an hour should not stall the request either.
             tokio::time::sleep(clamp_backoff(retry_after)).await;
         }
-        Err(ProviderError::Status(429))
+        Err(ProviderError::Status(last_status))
     }
 
     // ---- TVMaze ----
@@ -235,6 +267,26 @@ impl MetadataProviders {
             }
         }
         *last = Some(Instant::now());
+    }
+
+    /// Jikan is the preferred anime source, but it proxies MyAnimeList live and
+    /// answers 504 whenever MAL is unreachable. TVMaze lists most anime series,
+    /// so fall back to it rather than dropping the whole folder to filename
+    /// parsing.
+    async fn search_anime(&self, query: &str) -> Result<Vec<ShowCandidate>, ProviderError> {
+        let jikan_error = match self.search_jikan(query).await {
+            Ok(candidates) if !candidates.is_empty() => return Ok(candidates),
+            Ok(_) => None,
+            Err(err) => Some(err),
+        };
+        match self.search_tvmaze(query).await {
+            Ok(candidates) if !candidates.is_empty() => Ok(candidates),
+            Ok(empty) => match jikan_error {
+                Some(err) => Err(err),
+                None => Ok(empty),
+            },
+            Err(err) => Err(jikan_error.unwrap_or(err)),
+        }
     }
 
     async fn search_jikan(&self, query: &str) -> Result<Vec<ShowCandidate>, ProviderError> {
