@@ -11,6 +11,19 @@ static RELEASE_TRAIL_RE: Lazy<Regex> = Lazy::new(|| {
     )
     .unwrap()
 });
+/// Leading `[Group]` / `[Tags]` blocks, as in "[Tsundere-Raws] Show - 01".
+static BRACKET_BLOCK_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"\[[^\]]*\]").unwrap());
+/// First scene/release tag in a separator-normalised folder name. Everything
+/// from it onward (season marker, language, source, codecs, group, platform)
+/// is release noise, never part of the show title. Matched on lowercased text
+/// whose `._-` separators are already spaces, so "H.264" reads "h 264" and
+/// "E-AC-3" reads "e ac 3".
+static RELEASE_TAG_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(
+        r"(?i)(?:^|\s)(?:s\d{1,2}(?:\s?e\d{1,3})?|(?:season|saison)\s\d{1,2}|(?:19|20)\d{2}|2160p|1080p|720p|576p|480p|4k|uhd|multi|vostfr|vost|subfrench|truefrench|french|vff|vfq|vfi|vf2|vf|web(?:\s?dl|\s?rip)?|hdtv|blu\s?ray|bd\s?rip|br\s?rip|dvd\s?rip|bd|remux|[xh]\s?26[45]|hevc|avc|av1|aac|e?\s?ac\s?3|ddp?\d?|dts|flac|opus|10\s?bits?|8\s?bits?|hdr(?:10)?|int[ée]grale|complete|proper|repack|dsnp|amzn|nf|cr|adn|dual\s?audio)(?:\s|$)",
+    )
+    .unwrap()
+});
 static YEAR_RE: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"(?:^|[\s._(-])((?:19|20)\d{2})(?:$|[\s._)-])").unwrap());
 static YEAR_TOKEN_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?:19|20)\d{2}").unwrap());
@@ -287,6 +300,33 @@ pub fn show_title_from_folder(name: &str) -> (String, Option<i64>) {
     (title, year)
 }
 
+/// Like [`show_title_from_folder`], but for release-named show/anime folders:
+/// "Code.Geass.Rozé.of.the.Recapture.S01.MULTi.1080p.WEB.H.264.E-AC-3-Tsundere-Raws (DSNP)"
+/// -> ("Code Geass Rozé Of The Recapture", None). This is the string sent to
+/// the metadata providers, which return nothing for the raw release name.
+pub fn show_title_from_release(name: &str) -> (String, Option<i64>) {
+    let year = find_year(name);
+    let without_groups = BRACKET_BLOCK_RE.replace_all(name, " ");
+    let spaced = BRACKETS_RE.replace_all(&without_groups, " ");
+    let spaced = SEPARATORS_RE.replace_all(&spaced, " ");
+    let spaced = WHITESPACE_RE.replace_all(&spaced, " ");
+    let spaced = spaced.trim();
+    // Cut at the first release tag, but never at the very start: a title can
+    // legitimately begin with a year ("1917") or a short word.
+    let head = RELEASE_TAG_RE
+        .find_iter(spaced)
+        .find(|m| m.start() > 0)
+        .map(|m| &spaced[..m.start()])
+        .unwrap_or(spaced);
+    let title = clean_title(head);
+    let title = if title.is_empty() {
+        name.trim().to_string()
+    } else {
+        title
+    };
+    (title, year)
+}
+
 /// Artist/album/year/title derived for an audio track. Used as the fallback
 /// when ffprobe tags are missing (see `parse_music_file`).
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
@@ -469,6 +509,34 @@ mod tests {
         let (title, year) = show_title_from_folder("Black Lagoon (2006)");
         assert_eq!(title, "Black Lagoon");
         assert_eq!(year, Some(2006));
+    }
+
+    #[test]
+    fn release_title_strips_scene_tags() {
+        let cases = [
+            (
+                "Code.Geass.Rozé.of.the.Recapture.S01.MULTi.1080p.WEB.H.264.E-AC-3-Tsundere-Raws (DSNP)",
+                "Code Geass Rozé Of The Recapture",
+                None,
+            ),
+            (
+                "[Tsundere-Raws] Frieren - INTEGRALE (BluRay 1080p 10bits AV1)",
+                "Frieren",
+                None,
+            ),
+            ("Black Lagoon (2006)", "Black Lagoon", Some(2006)),
+            ("Spy x Family 2022 S02 VOSTFR 1080p", "Spy X Family", Some(2022)),
+            ("Vinland Saga Saison 2 MULTi BluRay x265", "Vinland Saga", None),
+            ("Mushishi", "Mushishi", None),
+            ("1917", "1917", Some(1917)),
+        ];
+        for (input, title, year) in cases {
+            assert_eq!(
+                show_title_from_release(input),
+                (title.to_string(), year),
+                "{input}"
+            );
+        }
     }
 
     #[test]

@@ -786,7 +786,7 @@ async fn enrich_group(
     search_cache: &mut HashMap<String, Vec<ShowCandidate>>,
     episode_cache: &mut HashMap<String, Vec<EpisodeCandidate>>,
 ) -> MatchGroup {
-    let (folder_title, folder_year) = crate::parser::show_title_from_folder(&group.group_name);
+    let (folder_title, folder_year) = crate::parser::show_title_from_release(&group.group_name);
 
     // One search for the whole folder.
     let search_result = match search_cache.get(&folder_title) {
