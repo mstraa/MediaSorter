@@ -142,6 +142,12 @@ const JIKAN_COOLDOWN: Duration = Duration::from_secs(5 * 60);
 const JIKAN_TIMEOUT: Duration = Duration::from_secs(10);
 
 const ANILIST_SEARCH_QUERY: &str = "query ($search: String) { Page(perPage: 10) { media(search: $search, type: ANIME, sort: SEARCH_MATCH) { id title { romaji english } seasonYear startDate { year } description(asHtml: false) } } }";
+const ANILIST_EPISODES_QUERY: &str =
+    "query ($id: Int) { Media(id: $id, type: ANIME) { idMal streamingEpisodes { title } } }";
+
+static STREAMING_EPISODE_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?i)^\s*(?:episode|ep\.?)\s*(\d{1,4})\s*[-–—:]\s*(.+?)\s*$").unwrap()
+});
 
 impl MetadataProviders {
     pub fn new(db: Database) -> Self {
@@ -189,8 +195,8 @@ impl MetadataProviders {
         match provider {
             "tvmaze" => self.tvmaze_episodes(provider_show_id).await,
             "jikan" => self.jikan_episodes(provider_show_id).await,
-            // AniList has no per-episode titles; filename parsing fills them.
-            "anilist" | "imdb" | "wikidata" => Ok(Vec::new()),
+            "anilist" => self.anilist_episodes(provider_show_id).await,
+            "imdb" | "wikidata" => Ok(Vec::new()),
             _ => self.episodes(media_type, provider_show_id).await,
         }
     }
@@ -359,7 +365,7 @@ impl MetadataProviders {
         ] {
             let result = match source {
                 "jikan" => self.search_jikan(query).await,
-                "anilist" => self.search_anilist(query).await,
+                "anilist" => self.search_anilist_relaxed(query).await,
                 _ => self.search_tvmaze(query).await,
             };
             match result {
@@ -470,6 +476,84 @@ impl MetadataProviders {
     }
 
     // ---- AniList (anime fallback) ----
+
+    /// AniList's search can miss a full release title ("Code Geass Rozé Of The
+    /// Recapture" finds nothing, "Code Geass" lists it first). Try the query
+    /// as is, without accents, then shorter prefixes, and rank what comes
+    /// back by how many query words each title contains.
+    async fn search_anilist_relaxed(
+        &self,
+        query: &str,
+    ) -> Result<Vec<ShowCandidate>, ProviderError> {
+        let found = self.search_anilist(query).await?;
+        if !found.is_empty() {
+            return Ok(found);
+        }
+        for attempt in relaxed_queries(query) {
+            let mut found = self.search_anilist(&attempt).await?;
+            found.sort_by(|a, b| {
+                title_similarity(query, &b.title).total_cmp(&title_similarity(query, &a.title))
+            });
+            if found
+                .first()
+                .is_some_and(|best| title_similarity(query, &best.title) >= 0.6)
+            {
+                return Ok(found);
+            }
+        }
+        Ok(Vec::new())
+    }
+
+    /// Episode titles for an AniList match: through its MyAnimeList id on
+    /// Jikan when Jikan answers, otherwise from AniList's own streaming
+    /// episode list ("Episode 3 - Title").
+    async fn anilist_episodes(
+        &self,
+        show_id: &str,
+    ) -> Result<Vec<EpisodeCandidate>, ProviderError> {
+        let id: i64 = show_id
+            .parse()
+            .map_err(|_| ProviderError::Other(format!("Invalid AniList id: {show_id}")))?;
+        let key = format!("anilist:episodes:{id}");
+        let data = match self.db.get_cache(&key) {
+            Some(cached) => cached,
+            None => {
+                let body = serde_json::json!({
+                    "query": ANILIST_EPISODES_QUERY,
+                    "variables": { "id": id },
+                });
+                let value = self
+                    .send_json(
+                        || self.client.post("https://graphql.anilist.co").json(&body),
+                        true,
+                    )
+                    .await?;
+                if let Some(message) = value["errors"][0]["message"].as_str() {
+                    return Err(ProviderError::Other(format!("AniList: {message}")));
+                }
+                self.db.set_cache(&key, &value);
+                value
+            }
+        };
+        let media = &data["data"]["Media"];
+        let mut jikan_error = None;
+        if let Some(mal_id) = media["idMal"].as_i64() {
+            match self.jikan_episodes(&mal_id.to_string()).await {
+                Ok(episodes) if !episodes.is_empty() => return Ok(episodes),
+                Ok(_) => {}
+                Err(err) => jikan_error = Some(err),
+            }
+        }
+        let episodes = anilist_streaming_episodes(show_id, media);
+        if episodes.is_empty() {
+            if let Some(err) = jikan_error {
+                return Err(ProviderError::Other(format!(
+                    "No episode titles: MyAnimeList (Jikan) failed ({err}) and AniList lists none."
+                )));
+            }
+        }
+        Ok(episodes)
+    }
 
     async fn search_anilist(&self, query: &str) -> Result<Vec<ShowCandidate>, ProviderError> {
         let key = format!("anilist:search:{}", query.to_lowercase());
@@ -779,6 +863,73 @@ fn anilist_candidates(data: &Value) -> Vec<ShowCandidate> {
         .collect()
 }
 
+/// Parse AniList `streamingEpisodes` titles such as "Episode 3 - The Witch".
+fn anilist_streaming_episodes(show_id: &str, media: &Value) -> Vec<EpisodeCandidate> {
+    let Some(items) = media["streamingEpisodes"].as_array() else {
+        return Vec::new();
+    };
+    let mut episodes: Vec<EpisodeCandidate> = items
+        .iter()
+        .filter_map(|item| {
+            let caps = STREAMING_EPISODE_RE.captures(item["title"].as_str()?)?;
+            Some(EpisodeCandidate {
+                provider: "anilist".to_string(),
+                provider_show_id: show_id.to_string(),
+                season: 1,
+                episode: caps[1].parse().ok()?,
+                title: caps[2].to_string(),
+            })
+        })
+        .collect();
+    episodes.sort_by_key(|e| e.episode);
+    episodes.dedup_by_key(|e| e.episode);
+    episodes
+}
+
+fn title_words(value: &str) -> Vec<String> {
+    fold_accents(&value.to_lowercase())
+        .split(|c: char| !c.is_alphanumeric())
+        // Linking words match almost any title and would inflate the score.
+        .filter(|w| !w.is_empty() && !STOP_WORDS.contains(w))
+        .map(str::to_string)
+        .collect()
+}
+
+const STOP_WORDS: [&str; 12] = [
+    "a", "an", "the", "of", "and", "to", "no", "wa", "ga", "de", "la", "le",
+];
+
+/// Share of the query's words found in `title` (0.0 to 1.0).
+fn title_similarity(query: &str, title: &str) -> f64 {
+    let query = title_words(query);
+    if query.is_empty() {
+        return 0.0;
+    }
+    let title = title_words(title);
+    let hits = query.iter().filter(|w| title.contains(w)).count();
+    hits as f64 / query.len() as f64
+}
+
+/// Looser AniList queries to try after the exact one found nothing: the
+/// accent-free form, then the first half of the words, then the first two.
+fn relaxed_queries(query: &str) -> Vec<String> {
+    let mut attempts = Vec::new();
+    let folded = fold_accents(query);
+    if folded != query {
+        attempts.push(folded);
+    }
+    let words: Vec<&str> = query.split_whitespace().collect();
+    for keep in [words.len().div_ceil(2), 2] {
+        if keep >= 2 && keep < words.len() {
+            let prefix = words[..keep].join(" ");
+            if !attempts.contains(&prefix) {
+                attempts.push(prefix);
+            }
+        }
+    }
+    attempts
+}
+
 /// Strip Latin diacritics: "Rozé" -> "Roze". Other characters are kept.
 fn fold_accents(value: &str) -> String {
     value
@@ -868,13 +1019,68 @@ mod tests {
             let jikan = providers.search_jikan(query).await.map(|c| c.len());
             println!("jikan   {query:?}: {jikan:?} in {:?}", started.elapsed());
             let started = std::time::Instant::now();
-            let anilist = providers.search_anilist(query).await;
+            let anilist = providers.search_anilist_relaxed(query).await;
             println!(
                 "anilist {query:?}: {:?} in {:?}",
                 anilist.as_ref().map(|c| c.first().map(|c| c.title.clone())),
                 started.elapsed()
             );
-            assert!(!providers.search_anime(query).await.unwrap().is_empty());
+            let found = providers.search_anime(query).await.unwrap();
+            assert!(!found.is_empty());
+            println!(
+                "search_anime {query:?}: first = {} ({})",
+                found[0].title, found[0].provider
+            );
+            if let Ok(Some(first)) = anilist.map(|c| c.first().cloned()) {
+                let started = std::time::Instant::now();
+                let episodes = providers.anilist_episodes(&first.provider_id).await;
+                println!(
+                    "anilist episodes for {}: {:?} in {:?}",
+                    first.title,
+                    episodes.map(|e| e
+                        .iter()
+                        .take(3)
+                        .map(|e| e.title.clone())
+                        .collect::<Vec<_>>()),
+                    started.elapsed()
+                );
+            }
         }
+    }
+
+    #[test]
+    fn relaxed_anilist_queries_and_ranking() {
+        assert_eq!(
+            relaxed_queries("Code Geass Rozé Of The Recapture"),
+            vec![
+                "Code Geass Roze Of The Recapture".to_string(),
+                "Code Geass Rozé".to_string(),
+                "Code Geass".to_string(),
+            ]
+        );
+        assert!(relaxed_queries("Mushishi").is_empty());
+        let q = "Code Geass Rozé Of The Recapture";
+        assert_eq!(
+            title_similarity(q, "Code Geass: Rozé of the Recapture"),
+            1.0
+        );
+        assert!(title_similarity(q, "Code Geass: Lelouch of the Rebellion") < 0.6);
+    }
+
+    #[test]
+    fn parses_anilist_streaming_episodes() {
+        let media = serde_json::json!({"streamingEpisodes": [
+            {"title": "Episode 2 - The Second One"},
+            {"title": "Episode 1 - Pilot: Part A"},
+            {"title": "Trailer"},
+        ]});
+        let episodes = anilist_streaming_episodes("42", &media);
+        assert_eq!(episodes.len(), 2);
+        assert_eq!(
+            (episodes[0].episode, episodes[0].title.as_str()),
+            (1, "Pilot: Part A")
+        );
+        assert_eq!(episodes[1].provider, "anilist");
+        assert!(anilist_streaming_episodes("42", &serde_json::json!({})).is_empty());
     }
 }
