@@ -350,9 +350,13 @@ impl MetadataProviders {
     /// most anime series too. The first error is reported only when nothing
     /// answered with candidates.
     async fn search_anime(&self, query: &str) -> Result<Vec<ShowCandidate>, ProviderError> {
-        let mut first_error = None;
-        let mut empty = Vec::new();
-        for source in ["jikan", "anilist", "tvmaze"] {
+        let mut outcomes = Vec::new();
+        let mut errors = 0;
+        for (source, label) in [
+            ("jikan", "Jikan"),
+            ("anilist", "AniList"),
+            ("tvmaze", "TVMaze"),
+        ] {
             let result = match source {
                 "jikan" => self.search_jikan(query).await,
                 "anilist" => self.search_anilist(query).await,
@@ -360,17 +364,23 @@ impl MetadataProviders {
             };
             match result {
                 Ok(candidates) if !candidates.is_empty() => return Ok(candidates),
-                Ok(none) => empty = none,
+                Ok(_) => outcomes.push(format!("{label}: no match")),
                 Err(err) => {
                     tracing::warn!(source, error = %err, "anime search failed, trying next provider");
-                    first_error.get_or_insert(err);
+                    errors += 1;
+                    outcomes.push(format!("{label}: {err}"));
                 }
             }
         }
-        match first_error {
-            Some(err) if empty.is_empty() => Err(err),
-            _ => Ok(empty),
+        if errors == 0 {
+            return Ok(Vec::new());
         }
+        // Name every provider tried, so a failure shows whether the fallbacks
+        // ran and what each one answered.
+        Err(ProviderError::Other(format!(
+            "no anime provider found \"{query}\" ({})",
+            outcomes.join("; ")
+        )))
     }
 
     async fn jikan_available(&self) -> bool {
