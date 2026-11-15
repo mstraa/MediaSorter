@@ -129,7 +129,19 @@ pub struct MetadataProviders {
     db: Database,
     client: reqwest::Client,
     last_jikan: Arc<Mutex<Option<Instant>>>,
+    /// Set when Jikan timed out or failed outright: until then, anime lookups
+    /// skip it and go straight to AniList instead of waiting on it again for
+    /// every folder in the batch.
+    jikan_down_until: Arc<Mutex<Option<Instant>>>,
 }
+
+/// How long to stop asking Jikan after it failed to answer.
+const JIKAN_COOLDOWN: Duration = Duration::from_secs(5 * 60);
+/// Per-request cap for Jikan. It is only the preferred anime source, not the
+/// only one, so it should fail fast and let AniList answer.
+const JIKAN_TIMEOUT: Duration = Duration::from_secs(10);
+
+const ANILIST_SEARCH_QUERY: &str = "query ($search: String) { Page(perPage: 10) { media(search: $search, type: ANIME, sort: SEARCH_MATCH) { id title { romaji english } seasonYear startDate { year } description(asHtml: false) } } }";
 
 impl MetadataProviders {
     pub fn new(db: Database) -> Self {
@@ -145,6 +157,7 @@ impl MetadataProviders {
             db,
             client,
             last_jikan: Arc::new(Mutex::new(None)),
+            jikan_down_until: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -176,7 +189,8 @@ impl MetadataProviders {
         match provider {
             "tvmaze" => self.tvmaze_episodes(provider_show_id).await,
             "jikan" => self.jikan_episodes(provider_show_id).await,
-            "imdb" | "wikidata" => Ok(Vec::new()),
+            // AniList has no per-episode titles; filename parsing fills them.
+            "anilist" | "imdb" | "wikidata" => Ok(Vec::new()),
             _ => self.episodes(media_type, provider_show_id).await,
         }
     }
@@ -205,12 +219,19 @@ impl MetadataProviders {
         Ok(value)
     }
 
+    /// Send the request built by `build` (rebuilt for each attempt) and parse
+    /// a JSON answer, retrying busy upstreams and one dropped connection.
     async fn get_json(&self, url: &str) -> Result<Value, ProviderError> {
+        self.send_json(|| self.client.get(url), true).await
+    }
+
+    async fn send_json<F>(&self, build: F, retry_dropped: bool) -> Result<Value, ProviderError>
+    where
+        F: Fn() -> reqwest::RequestBuilder,
+    {
         let mut last_status = 429u16;
         for attempt in 0..3 {
-            let response = match self
-                .client
-                .get(url)
+            let response = match build()
                 .header("Accept", "application/json")
                 .header("Api-User-Agent", USER_AGENT)
                 .send()
@@ -220,8 +241,10 @@ impl MetadataProviders {
                 // Jikan regularly drops or stalls a connection under load
                 // (it proxies MyAnimeList live). A timeout or failed connect
                 // says nothing about the request, so retry it once.
-                Err(err) if attempt == 0 && (err.is_timeout() || err.is_connect()) => {
-                    tracing::warn!(url, error = %describe_reqwest_error(&err), "provider request failed, retrying");
+                Err(err)
+                    if retry_dropped && attempt == 0 && (err.is_timeout() || err.is_connect()) =>
+                {
+                    tracing::warn!(error = %describe_reqwest_error(&err), "provider request failed, retrying");
                     tokio::time::sleep(clamp_backoff(2.0 * (attempt as f64 + 1.0))).await;
                     continue;
                 }
@@ -321,36 +344,97 @@ impl MetadataProviders {
         *last = Some(Instant::now());
     }
 
-    /// Jikan is the preferred anime source, but it proxies MyAnimeList live and
-    /// answers 504 whenever MAL is unreachable. TVMaze lists most anime series,
-    /// so fall back to it rather than dropping the whole folder to filename
-    /// parsing.
+    /// Jikan is the preferred anime source (its MAL ids also give episode
+    /// titles), but it proxies MyAnimeList live and regularly times out or
+    /// answers 504. AniList is the fallback for anime, then TVMaze, which lists
+    /// most anime series too. The first error is reported only when nothing
+    /// answered with candidates.
     async fn search_anime(&self, query: &str) -> Result<Vec<ShowCandidate>, ProviderError> {
-        let jikan_error = match self.search_jikan(query).await {
-            Ok(candidates) if !candidates.is_empty() => return Ok(candidates),
-            Ok(_) => None,
-            Err(err) => Some(err),
-        };
-        match self.search_tvmaze(query).await {
-            Ok(candidates) if !candidates.is_empty() => Ok(candidates),
-            Ok(empty) => match jikan_error {
-                Some(err) => Err(err),
-                None => Ok(empty),
-            },
-            Err(err) => Err(jikan_error.unwrap_or(err)),
+        let mut first_error = None;
+        let mut empty = Vec::new();
+        for source in ["jikan", "anilist", "tvmaze"] {
+            let result = match source {
+                "jikan" => self.search_jikan(query).await,
+                "anilist" => self.search_anilist(query).await,
+                _ => self.search_tvmaze(query).await,
+            };
+            match result {
+                Ok(candidates) if !candidates.is_empty() => return Ok(candidates),
+                Ok(none) => empty = none,
+                Err(err) => {
+                    tracing::warn!(source, error = %err, "anime search failed, trying next provider");
+                    first_error.get_or_insert(err);
+                }
+            }
+        }
+        match first_error {
+            Some(err) if empty.is_empty() => Err(err),
+            _ => Ok(empty),
+        }
+    }
+
+    async fn jikan_available(&self) -> bool {
+        let mut down = self.jikan_down_until.lock().await;
+        match *down {
+            Some(until) if Instant::now() < until => false,
+            Some(_) => {
+                *down = None;
+                true
+            }
+            None => true,
+        }
+    }
+
+    /// Fetch from Jikan with its own short timeout, and put Jikan on cooldown
+    /// when it does not answer or answers with a server error.
+    async fn jikan_fetch(&self, key: &str, url: &str) -> Result<Value, ProviderError> {
+        if let Some(cached) = self.db.get_cache(key) {
+            return Ok(cached);
+        }
+        if !self.jikan_available().await {
+            return Err(ProviderError::Other(
+                "Jikan (MyAnimeList) is not responding; skipped for a few minutes.".to_string(),
+            ));
+        }
+        self.throttle_jikan().await;
+        match self
+            // No retry on a stalled search: the same query stalls again, and
+            // AniList is next in line.
+            .send_json(|| self.client.get(url).timeout(JIKAN_TIMEOUT), false)
+            .await
+        {
+            Ok(value) => {
+                self.db.set_cache(key, &value);
+                Ok(value)
+            }
+            Err(err) => {
+                // A timeout can be specific to one slow search, so it does not
+                // bench Jikan for everyone; a refused connection or a server
+                // error does.
+                let down = match &err {
+                    ProviderError::Http(message) => !message.contains("timed out"),
+                    ProviderError::Status(code) => *code == 429 || *code >= 500,
+                    ProviderError::Other(_) => false,
+                };
+                if down {
+                    *self.jikan_down_until.lock().await = Some(Instant::now() + JIKAN_COOLDOWN);
+                }
+                Err(err)
+            }
         }
     }
 
     async fn search_jikan(&self, query: &str) -> Result<Vec<ShowCandidate>, ProviderError> {
+        // Jikan's full-text search stalls on some non-ASCII queries ("Rozé"
+        // timed out where "Lelouch" answered at once), and MAL titles are
+        // romanised anyway, so send it the accent-free form.
+        let query = fold_accents(query);
         let key = format!("jikan:search:{}", query.to_lowercase());
-        if self.db.get_cache(&key).is_none() {
-            self.throttle_jikan().await;
-        }
         let url = format!(
             "https://api.jikan.moe/v4/anime?q={}&limit=10",
-            urlencoding::encode(query)
+            urlencoding::encode(&query)
         );
-        let data = self.cached_or_fetch(&key, &url).await?;
+        let data = self.jikan_fetch(&key, &url).await?;
         let mut candidates = Vec::new();
         if let Some(items) = data["data"].as_array() {
             for item in items.iter().take(10) {
@@ -375,16 +459,40 @@ impl MetadataProviders {
         Ok(candidates)
     }
 
+    // ---- AniList (anime fallback) ----
+
+    async fn search_anilist(&self, query: &str) -> Result<Vec<ShowCandidate>, ProviderError> {
+        let key = format!("anilist:search:{}", query.to_lowercase());
+        let data = match self.db.get_cache(&key) {
+            Some(cached) => cached,
+            None => {
+                let body = serde_json::json!({
+                    "query": ANILIST_SEARCH_QUERY,
+                    "variables": { "search": query },
+                });
+                let value = self
+                    .send_json(
+                        || self.client.post("https://graphql.anilist.co").json(&body),
+                        true,
+                    )
+                    .await?;
+                if let Some(message) = value["errors"][0]["message"].as_str() {
+                    return Err(ProviderError::Other(format!("AniList: {message}")));
+                }
+                self.db.set_cache(&key, &value);
+                value
+            }
+        };
+        Ok(anilist_candidates(&data))
+    }
+
     async fn jikan_episodes(&self, show_id: &str) -> Result<Vec<EpisodeCandidate>, ProviderError> {
         let key = format!("jikan:episodes:{show_id}");
-        if self.db.get_cache(&key).is_none() {
-            self.throttle_jikan().await;
-        }
         let url = format!(
             "https://api.jikan.moe/v4/anime/{}/episodes",
             urlencoding::encode(show_id)
         );
-        let data = self.cached_or_fetch(&key, &url).await?;
+        let data = self.jikan_fetch(&key, &url).await?;
         let mut episodes = Vec::new();
         if let Some(items) = data["data"].as_array() {
             // Jikan returns one MAL entry's episodes (one "season"). Use the
@@ -632,6 +740,61 @@ fn year_from_description(description: &str) -> Option<i64> {
         .and_then(|m| m.as_str().parse().ok())
 }
 
+/// Map AniList `Page.media` results to candidates.
+fn anilist_candidates(data: &Value) -> Vec<ShowCandidate> {
+    let Some(items) = data["data"]["Page"]["media"].as_array() else {
+        return Vec::new();
+    };
+    items
+        .iter()
+        .take(10)
+        .map(|item| {
+            let title = item["title"]["english"]
+                .as_str()
+                .or_else(|| item["title"]["romaji"].as_str())
+                .unwrap_or("Unknown")
+                .to_string();
+            let year = item["seasonYear"]
+                .as_i64()
+                .or_else(|| item["startDate"]["year"].as_i64());
+            let summary = strip_html(item["description"].as_str().unwrap_or(""));
+            ShowCandidate {
+                provider: "anilist".to_string(),
+                provider_id: value_to_id(&item["id"]),
+                title,
+                year,
+                summary: truncate(&summary, 240),
+            }
+        })
+        .collect()
+}
+
+/// Strip Latin diacritics: "Rozé" -> "Roze". Other characters are kept.
+fn fold_accents(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| match ch {
+            'à' | 'á' | 'â' | 'ã' | 'ä' | 'å' | 'ā' => 'a',
+            'À' | 'Á' | 'Â' | 'Ã' | 'Ä' | 'Å' | 'Ā' => 'A',
+            'è' | 'é' | 'ê' | 'ë' | 'ē' => 'e',
+            'È' | 'É' | 'Ê' | 'Ë' | 'Ē' => 'E',
+            'ì' | 'í' | 'î' | 'ï' | 'ī' => 'i',
+            'Ì' | 'Í' | 'Î' | 'Ï' | 'Ī' => 'I',
+            'ò' | 'ó' | 'ô' | 'õ' | 'ö' | 'ō' | 'ø' => 'o',
+            'Ò' | 'Ó' | 'Ô' | 'Õ' | 'Ö' | 'Ō' | 'Ø' => 'O',
+            'ù' | 'ú' | 'û' | 'ü' | 'ū' => 'u',
+            'Ù' | 'Ú' | 'Û' | 'Ü' | 'Ū' => 'U',
+            'ç' => 'c',
+            'Ç' => 'C',
+            'ñ' => 'n',
+            'Ñ' => 'N',
+            'ý' | 'ÿ' => 'y',
+            'Ý' => 'Y',
+            other => other,
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -654,5 +817,54 @@ mod tests {
             message.len() > "could not connect to 127.0.0.1".len(),
             "{message}"
         );
+    }
+
+    #[test]
+    fn folds_accents_for_jikan() {
+        assert_eq!(
+            fold_accents("Code Geass Rozé Of The Recapture"),
+            "Code Geass Roze Of The Recapture"
+        );
+        assert_eq!(fold_accents("Pokémon Ça Ñ 東京"), "Pokemon Ca N 東京");
+    }
+
+    #[test]
+    fn maps_anilist_results() {
+        let data = serde_json::json!({"data": {"Page": {"media": [
+            {"id": 139609, "title": {"romaji": "Code Geass: Dakkan no Rozé", "english": "Code Geass: Rozé of the Recapture"},
+             "seasonYear": null, "startDate": {"year": 2024}, "description": "<i>Neo</i> Britannia."},
+            {"id": 1, "title": {"romaji": "Only Romaji", "english": null}, "seasonYear": 2001, "startDate": {"year": 2000}, "description": null}
+        ]}}});
+        let found = anilist_candidates(&data);
+        assert_eq!(found.len(), 2);
+        assert_eq!(found[0].provider, "anilist");
+        assert_eq!(found[0].provider_id, "139609");
+        assert_eq!(found[0].title, "Code Geass: Rozé of the Recapture");
+        assert_eq!(found[0].year, Some(2024));
+        assert_eq!(found[0].summary, "Neo Britannia.");
+        assert_eq!(found[1].title, "Only Romaji");
+        assert_eq!(found[1].year, Some(2001));
+    }
+
+    /// Hits the real APIs: `cargo test live_anime -- --ignored --nocapture`.
+    #[tokio::test]
+    #[ignore]
+    async fn live_anime_lookup() {
+        let dir = std::env::temp_dir().join(format!("tvsorter-live-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let providers = MetadataProviders::new(Database::open(&dir.join("test.db")).unwrap());
+        for query in ["Code Geass Rozé Of The Recapture", "Code Geass Lelouch"] {
+            let started = std::time::Instant::now();
+            let jikan = providers.search_jikan(query).await.map(|c| c.len());
+            println!("jikan   {query:?}: {jikan:?} in {:?}", started.elapsed());
+            let started = std::time::Instant::now();
+            let anilist = providers.search_anilist(query).await;
+            println!(
+                "anilist {query:?}: {:?} in {:?}",
+                anilist.as_ref().map(|c| c.first().map(|c| c.title.clone())),
+                started.elapsed()
+            );
+            assert!(!providers.search_anime(query).await.unwrap().is_empty());
+        }
     }
 }
