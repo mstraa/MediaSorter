@@ -60,9 +60,10 @@ function matchEpisodeTitle(
 ): string | null {
   const exact = episodes.find((e) => e.season === season && e.episode === episode);
   if (exact) return exact.title;
-  // Jikan lists one flat season per MAL entry, so absolute numbering is all
-  // there is. An anime matched on TVMaze has real seasons — don't guess there.
-  if (isAnime && episodes[0]?.provider === "jikan") {
+  // Jikan and AniList list one flat season per entry, so absolute numbering
+  // is all there is. An anime matched on TVMaze has real seasons — don't guess there.
+  const provider = episodes[0]?.provider;
+  if (isAnime && (provider === "jikan" || provider === "anilist")) {
     const byNumber = episodes.find((e) => e.episode === episode);
     if (byNumber) return byNumber.title;
   }
@@ -239,9 +240,26 @@ export default function MatchPage() {
 
     if (isFilm || !candidate.provider_id) return;
 
+    await fetchEpisodeTitles(
+      gi,
+      candidate.provider_id,
+      candidate.provider,
+      `Applied "${candidate.title}". `,
+    );
+  }
+
+  // Fetch the provider's episode list for a group and copy matching titles onto
+  // its episodes. Says so when the provider has no titles, instead of leaving
+  // every row on "Episode" without a word.
+  async function fetchEpisodeTitles(
+    gi: number,
+    providerShowId: string,
+    provider: string | null | undefined,
+    prefix = "",
+  ) {
     progress.startDelayed("Loading episodes...");
     try {
-      const { results } = await api.episodes(mediaType, candidate.provider_id, candidate.provider);
+      const { results } = await api.episodes(mediaType, providerShowId, provider ?? undefined);
       setGroups((prev) =>
         prev.map((group, i) => {
           if (i !== gi) return group;
@@ -260,8 +278,16 @@ export default function MatchPage() {
           };
         }),
       );
-    } catch {
-      // Ignore episode lookup failures; titles fall back to parsed values.
+      updateGroup(gi, {
+        searchStatus:
+          results.length === 0
+            ? `${prefix}No episode titles available for this match; titles come from file names.`
+            : `${prefix}Loaded ${results.length} episode titles.`,
+      });
+    } catch (e) {
+      updateGroup(gi, {
+        searchStatus: `${prefix}${e instanceof ApiError ? e.message : "Could not load episodes."}`,
+      });
     } finally {
       progress.hide();
     }
@@ -283,17 +309,7 @@ export default function MatchPage() {
       updateGroup(gi, { searchStatus: "Match a show first to load episodes." });
       return;
     }
-    progress.startDelayed("Loading episodes...");
-    try {
-      const { results } = await api.episodes(mediaType, providerShowId, provider);
-      updateGroup(gi, { episodeOptions: results });
-    } catch (e) {
-      updateGroup(gi, {
-        searchStatus: e instanceof ApiError ? e.message : "Could not load episodes.",
-      });
-    } finally {
-      progress.hide();
-    }
+    await fetchEpisodeTitles(gi, providerShowId, provider);
   }
 
   function buildBatch(): ImportBatch {
