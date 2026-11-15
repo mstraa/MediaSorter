@@ -1123,9 +1123,18 @@ details summary {
 }
 
 .import-items .col-cancel {
-  width: 40px;
+  width: 72px;
   text-align: center;
-  padding: 0;
+  padding: 0 4px;
+  white-space: nowrap;
+}
+
+/* Per-file "Force" on a skipped item: compact so the row height holds. */
+.force-button {
+  min-height: 0;
+  height: 24px;
+  padding: 0 10px;
+  font-size: 12px;
 }
 
 .import-item-row td {

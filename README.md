@@ -91,6 +91,7 @@ cd frontend && npm run build   # type-check + bundle the frontend
 - Preview destination paths before importing.
 - Import by **copy** (default), **hardlink**, **move**, or **test**/preview-only mode.
 - Handle destination conflicts with skip, replace, keep-both indexing, or fail.
+- Force a skipped file from the Imports page: a file skipped because its destination already exists gets a **Force** button (and the job a **Force all skipped** button) that imports it again, replacing the existing file.
 - Run imports as background jobs with current item, total progress, current-file
   copy progress, whole-job cancellation, and per-item cancellation.
 - Remove partial destination files when a copy is cancelled.

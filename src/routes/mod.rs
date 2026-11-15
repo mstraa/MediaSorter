@@ -43,6 +43,7 @@ pub fn build_router(state: AppState) -> Router {
             post(cancel_import_item),
         )
         .route("/api/import-jobs/:id/results", get(import_job_results))
+        .route("/api/import-jobs/:id/force", post(force_import_job))
         .route("/api/library", get(library))
         .route("/api/library/rescan", post(rescan_library))
         .route("/api/history", get(history))
@@ -958,6 +959,41 @@ async fn cancel_import_job(
         .ok_or_else(|| AppError::not_found("Import job not found"))?;
     job.request_cancel();
     Ok(Json(snapshot_json(&job)))
+}
+
+#[derive(serde::Deserialize, Default)]
+struct ForceRequest {
+    /// 1-based item indexes to force; absent forces every skipped file.
+    #[serde(default)]
+    indexes: Option<Vec<usize>>,
+}
+
+/// Re-import files a job skipped because their destination already existed,
+/// this time replacing it. The files go through the normal queue (appended to
+/// the running job, or a new one), so they get the same progress, cancel and
+/// history as any other import. The requests were validated when the original
+/// job started, so they are reused as they are, only with the policy changed.
+async fn force_import_job(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+    body: Option<Json<ForceRequest>>,
+) -> AppResult<Json<Value>> {
+    let job = state
+        .jobs
+        .get(&id)
+        .ok_or_else(|| AppError::not_found("Import job not found"))?;
+    let Json(body) = body.unwrap_or_default();
+    let snapshot = blocking(move || {
+        let requests = job.take_forced_requests(body.indexes.as_deref());
+        if requests.is_empty() {
+            return Err(AppError::bad_request("No skipped file to force"));
+        }
+        let rate = state.copy_rate_limit_mbps();
+        let forced = state.jobs.start(requests, state.db.clone(), rate);
+        Ok(snapshot_json(&forced))
+    })
+    .await?;
+    Ok(Json(snapshot))
 }
 
 async fn import_job_results(

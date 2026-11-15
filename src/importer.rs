@@ -420,6 +420,17 @@ fn is_same_file(a: &Path, b: &Path) -> bool {
     crate::filesystem::canonical_or_normalized(a) == crate::filesystem::canonical_or_normalized(b)
 }
 
+/// True when an import was skipped only because its destination already
+/// existed under the `skip` policy, i.e. re-running it with `replace` would
+/// actually overwrite something. A self-import (the source already is its own
+/// destination) is also reported as "skipped" but must never be forced:
+/// `replace` would have nothing to swap and the file is already in place.
+pub fn skipped_on_existing_destination(result: &ImportResult) -> bool {
+    result.result == "skipped"
+        && result.request.conflict_policy == "skip"
+        && !is_same_file(&result.request.source_path, Path::new(&result.final_path))
+}
+
 fn cancelled(cancel: Option<CancelFn<'_>>) -> bool {
     cancel.map(|c| c()).unwrap_or(false)
 }
@@ -808,6 +819,58 @@ mod tests {
         assert_eq!(first.result, "imported");
         let second = execute_import(request(source, out, "copy", "skip"), None, None, None);
         assert_eq!(second.result, "skipped");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The "Force" flow: a file skipped because its destination exists is
+    /// offered for forcing, and re-running it with `replace` overwrites the
+    /// library copy with the new source.
+    #[test]
+    fn forcing_a_skipped_file_replaces_the_existing_destination() {
+        let dir = temp_dir();
+        let old = dir.join("old.mkv");
+        File::create(&old).unwrap().write_all(b"old").unwrap();
+        let out = dir.join("out");
+        let first = execute_import(request(old, out.clone(), "copy", "skip"), None, None, None);
+        assert_eq!(first.result, "imported");
+
+        let new = dir.join("new.mkv");
+        File::create(&new)
+            .unwrap()
+            .write_all(b"new version")
+            .unwrap();
+        let skipped = execute_import(
+            request(new.clone(), out.clone(), "copy", "skip"),
+            None,
+            None,
+            None,
+        );
+        assert_eq!(skipped.result, "skipped");
+        assert!(skipped_on_existing_destination(&skipped));
+
+        let mut forced = skipped.request.clone();
+        forced.conflict_policy = "replace".to_string();
+        let result = execute_import(forced, None, None, None);
+        assert_eq!(result.result, "imported");
+        assert_eq!(result.final_path, first.final_path);
+        assert_eq!(fs::read(&result.final_path).unwrap(), b"new version");
+        assert!(new.exists(), "a forced copy must keep its source");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A self-import is skipped too, but forcing it would be meaningless, so it
+    /// must not be offered.
+    #[test]
+    fn a_self_import_is_not_forceable() {
+        let dir = temp_dir();
+        let out = dir.join("out");
+        let probe = request(dir.join("src.mkv"), out.clone(), "copy", "skip");
+        let dest = build_destination(&probe);
+        fs::create_dir_all(dest.parent().unwrap()).unwrap();
+        File::create(&dest).unwrap().write_all(b"payload").unwrap();
+        let result = execute_import(request(dest, out, "copy", "skip"), None, None, None);
+        assert_eq!(result.result, "skipped");
+        assert!(!skipped_on_existing_destination(&result));
         fs::remove_dir_all(&dir).ok();
     }
 

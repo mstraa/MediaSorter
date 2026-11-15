@@ -137,6 +137,8 @@ export interface JobItem {
   /** What bytes/total count: "bytes" (copy, move) or "items" (hardlink, test). */
   unit: string;
   error: string | null;
+  /** Skipped because the destination already existed: can be forced (replaced). */
+  forceable: boolean;
 }
 
 export interface JobSnapshot {
