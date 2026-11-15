@@ -1,5 +1,6 @@
+import { useState } from "react";
 import { Link } from "react-router-dom";
-import { api } from "../api";
+import { api, ApiError } from "../api";
 import { useImports } from "../components/ImportsContext";
 import { formatBytes } from "../theme";
 
@@ -47,6 +48,23 @@ export default function ImportsPage() {
     }
   }
 
+  // Re-run skipped files with the "replace" policy. The backend clears each
+  // file's `forceable` flag as it enqueues it, so a second click is harmless;
+  // `forcing` only stops a click from landing while the first is in flight.
+  const [forcing, setForcing] = useState(false);
+  async function forceItems(id: string, indexes?: number[]) {
+    if (forcing) return;
+    setForcing(true);
+    try {
+      await api.forceImportJob(id, indexes);
+    } catch (e) {
+      alert(e instanceof ApiError ? e.message : "Could not force the import.");
+    } finally {
+      setForcing(false);
+      refresh();
+    }
+  }
+
   async function cancelItem(id: string, index: number) {
     try {
       await api.cancelImportItem(id, index);
@@ -74,6 +92,8 @@ export default function ImportsPage() {
             job={job}
             onCancelJob={() => cancelJob(job.id)}
             onCancelItem={(index) => cancelItem(job.id, index)}
+            onForce={(indexes) => forceItems(job.id, indexes)}
+            forcing={forcing}
           />
         ))
       )}
@@ -85,9 +105,13 @@ interface JobCardProps {
   job: JobSnapshot;
   onCancelJob: () => void;
   onCancelItem: (index: number) => void;
+  /** Replace existing destinations; no indexes = every forceable file. */
+  onForce: (indexes?: number[]) => void;
+  forcing: boolean;
 }
 
-function JobCard({ job, onCancelJob, onCancelItem }: JobCardProps) {
+function JobCard({ job, onCancelJob, onCancelItem, onForce, forcing }: JobCardProps) {
+  const forceableCount = job.items.filter((item) => item.forceable).length;
   const stateLabel =
     job.state === "running" ? "running" : job.state === "cancelled" ? "cancelled" : "done";
   return (
@@ -110,6 +134,17 @@ function JobCard({ job, onCancelJob, onCancelItem }: JobCardProps) {
             <Link className="secondary-button" to={`/results/${job.id}`}>
               View results
             </Link>
+          )}
+          {forceableCount > 0 && (
+            <button
+              className="secondary-button"
+              type="button"
+              disabled={forcing}
+              title="Import the skipped files again, replacing the files already in the library"
+              onClick={() => onForce()}
+            >
+              Force all skipped ({forceableCount})
+            </button>
           )}
         </div>
         <div className="import-progress">
@@ -154,6 +189,17 @@ function JobCard({ job, onCancelJob, onCancelItem }: JobCardProps) {
                     : ""}
               </td>
               <td className="col-cancel">
+                {item.forceable && (
+                  <button
+                    className="secondary-button force-button"
+                    type="button"
+                    disabled={forcing}
+                    title="Replace the file already in the library with this one"
+                    onClick={() => onForce([item.index])}
+                  >
+                    Force
+                  </button>
+                )}
                 {itemIsActive(item) && job.active && (
                   <button
                     className="icon-cancel"

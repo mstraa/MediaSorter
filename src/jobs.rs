@@ -7,8 +7,8 @@ use uuid::Uuid;
 
 use crate::db::Database;
 use crate::importer::{
-    build_destination, execute_import, import_request_units, result_to_record, stat_source,
-    ImportRequest, ImportResult,
+    build_destination, execute_import, import_request_units, result_to_record,
+    skipped_on_existing_destination, stat_source, ImportRequest, ImportResult,
 };
 
 /// One file within an import job. `status` is one of:
@@ -27,6 +27,10 @@ pub struct JobItem {
     /// UI needs this to avoid rendering an item count as a file size.
     pub unit: &'static str,
     pub error: Option<String>,
+    /// Skipped because the destination already existed: the UI offers to
+    /// force it, re-running the same file with the `replace` policy. Cleared
+    /// once forced so a double click cannot enqueue the file twice.
+    pub forceable: bool,
 }
 
 /// Progress unit for an action: copies and moves stream bytes, hardlinks and
@@ -104,6 +108,7 @@ fn build_item(index: usize, request: &ImportRequest) -> JobItem {
         total: import_request_units(request),
         unit: unit_for(&request.action),
         error: None,
+        forceable: false,
     }
 }
 
@@ -227,6 +232,30 @@ impl Job {
         let total = s.total_items;
         s.label = make_label(&media, total);
         true
+    }
+
+    /// Take the requests of the files that were skipped because their
+    /// destination already existed, rewritten to the `replace` policy so they
+    /// overwrite it. `indexes` (1-based) narrows it to specific files; `None`
+    /// takes every forceable file. Each one is marked as no longer forceable,
+    /// so forcing it again returns nothing.
+    pub fn take_forced_requests(&self, indexes: Option<&[usize]>) -> Vec<ImportRequest> {
+        let mut s = self.lock();
+        let mut forced = Vec::new();
+        for i in 0..s.items.len() {
+            let wanted = indexes.is_none_or(|list| list.contains(&s.items[i].index));
+            if !wanted || !s.items[i].forceable {
+                continue;
+            }
+            let Some(request) = s.requests.get(i) else {
+                continue;
+            };
+            let mut request = request.clone();
+            request.conflict_policy = "replace".to_string();
+            forced.push(request);
+            s.items[i].forceable = false;
+        }
+        forced
     }
 
     /// Cancel the whole job: the running file is aborted and every queued file
@@ -468,9 +497,11 @@ fn run_job(state: Arc<Mutex<JobState>>, db: Database, copy_rate_limit_mbps: Opti
             let status = result.result.clone();
             let final_path = result.final_path.clone();
             let error = result.error.clone();
+            let forceable = skipped_on_existing_destination(&result);
             s.results.push(result);
             if let Some(item) = s.items.get_mut(cursor) {
                 item.status = status;
+                item.forceable = forceable;
                 item.destination = final_path;
                 item.error = error;
                 item.bytes = item.total;
@@ -533,6 +564,76 @@ mod tests {
         let mut jobs: Vec<Arc<Job>> = (0..3).map(|seq| finished_job(seq, "done")).collect();
         prune_finished(&mut jobs);
         assert_eq!(jobs.len(), 3);
+    }
+
+    fn request(name: &str, policy: &str) -> ImportRequest {
+        ImportRequest {
+            source_path: std::path::PathBuf::from(format!("/in/{name}")),
+            output_root: std::path::PathBuf::from("/out"),
+            media_type: "tv".to_string(),
+            show_title: "Fringe".to_string(),
+            show_year: None,
+            season_number: 1,
+            episode_number: 1,
+            episode_title: "Pilot".to_string(),
+            quality: String::new(),
+            action: "copy".to_string(),
+            conflict_policy: policy.to_string(),
+            provider: None,
+            provider_show_id: None,
+            origin: name.to_string(),
+        }
+    }
+
+    fn job_with(items: &[(&str, bool)]) -> Job {
+        let requests: Vec<ImportRequest> = items
+            .iter()
+            .map(|(name, _)| request(name, "skip"))
+            .collect();
+        let items = requests
+            .iter()
+            .zip(items)
+            .enumerate()
+            .map(|(i, (req, (_, forceable)))| {
+                let mut item = build_item(i + 1, req);
+                item.status = if *forceable { "skipped" } else { "imported" }.to_string();
+                item.forceable = *forceable;
+                item
+            })
+            .collect();
+        Job {
+            id: "job".to_string(),
+            seq: 0,
+            state: Arc::new(Mutex::new(JobState {
+                state: "done".to_string(),
+                items,
+                requests,
+                ..Default::default()
+            })),
+        }
+    }
+
+    #[test]
+    fn forcing_takes_only_skipped_files_and_switches_them_to_replace() {
+        let job = job_with(&[("a.mkv", true), ("b.mkv", false), ("c.mkv", true)]);
+        let forced = job.take_forced_requests(None);
+        let names: Vec<_> = forced.iter().map(|r| r.origin.as_str()).collect();
+        assert_eq!(names, ["a.mkv", "c.mkv"]);
+        assert!(forced.iter().all(|r| r.conflict_policy == "replace"));
+        // Forcing again is a no-op, so a double click cannot enqueue twice.
+        assert!(job.take_forced_requests(None).is_empty());
+        assert!(job.snapshot().items.iter().all(|item| !item.forceable));
+    }
+
+    #[test]
+    fn forcing_can_target_a_single_file() {
+        let job = job_with(&[("a.mkv", true), ("b.mkv", true)]);
+        let forced = job.take_forced_requests(Some(&[2]));
+        assert_eq!(forced.len(), 1);
+        assert_eq!(forced[0].origin, "b.mkv");
+        let left = job.take_forced_requests(None);
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].origin, "a.mkv");
     }
 
     #[test]

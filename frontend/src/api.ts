@@ -94,6 +94,13 @@ export const api = {
       { method: "POST" },
     ),
 
+  /** Re-import skipped files, replacing their existing destination. No indexes = every skipped file. */
+  forceImportJob: (id: string, indexes?: number[]) =>
+    request<JobSnapshot>(`/api/import-jobs/${encodeURIComponent(id)}/force`, {
+      method: "POST",
+      body: JSON.stringify(indexes ? { indexes } : {}),
+    }),
+
   getImportJobResults: (id: string) =>
     request<{ results: PreviewResult[] }>(`/api/import-jobs/${encodeURIComponent(id)}/results`),
 
