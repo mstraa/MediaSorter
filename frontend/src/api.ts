@@ -53,10 +53,13 @@ export const api = {
       body: JSON.stringify(payload),
     }),
 
-  getBrowse: (rootId: number | null, path: string) => {
+  getBrowse: (rootId: number | null, path: string, status?: string) => {
     const params = new URLSearchParams();
     if (rootId != null) params.set("root_id", String(rootId));
     params.set("path", path);
+    // Filtering server-side lets "Only no status" skip folders that already
+    // have a status instead of walking every file under them.
+    if (status && status !== "all") params.set("status", status);
     return request<BrowseResponse>(`/api/browse?${params.toString()}`);
   },
 
