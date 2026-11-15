@@ -81,7 +81,24 @@ export const api = {
       body: JSON.stringify(batch),
     }),
 
-  listImportJobs: () => request<{ jobs: JobSnapshot[] }>("/api/import-jobs"),
+  /**
+   * Poll the job list. Pass the `etag` of the list you already hold: resolves
+   * to `null` when it is unchanged (the server answered 304), so the caller
+   * can skip a re-render.
+   */
+  listImportJobs: async (
+    etag?: string | null,
+  ): Promise<{ jobs: JobSnapshot[]; etag: string | null } | null> => {
+    const headers: Record<string, string> = {};
+    if (etag) headers["If-None-Match"] = etag;
+    // `no-store` keeps the browser cache out of it: otherwise it revalidates
+    // on its own and hands back a 200 with the cached body, hiding the 304.
+    const response = await fetch("/api/import-jobs", { headers, cache: "no-store" });
+    if (response.status === 304) return null;
+    if (!response.ok) throw new ApiError(`Request failed (${response.status})`);
+    const body = (await response.json()) as { jobs: JobSnapshot[] };
+    return { jobs: body.jobs, etag: response.headers.get("ETag") };
+  },
 
   clearImportJobs: () =>
     request<{ cleared: number; jobs: JobSnapshot[] }>("/api/import-jobs/clear", { method: "POST" }),

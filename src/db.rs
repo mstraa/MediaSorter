@@ -194,6 +194,15 @@ pub struct LibraryFileRow {
     pub updated_at: String,
 }
 
+/// A media file found by a library rescan, stat'd before it reaches the
+/// database (see [`Database::upsert_discovered_files`]).
+#[derive(Clone, Debug)]
+pub struct DiscoveredFile {
+    pub path: PathBuf,
+    pub size: i64,
+    pub mtime: Option<f64>,
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct SourceStatusOverride {
     pub source_path: String,
@@ -552,9 +561,25 @@ impl Database {
     }
 
     pub fn set_source_status_overrides(&self, source_paths: &[PathBuf], status: Option<&str>) {
+        let normalized: Vec<PathBuf> = source_paths
+            .iter()
+            .map(|p| canonical_or_normalized(p))
+            .collect();
+        self.set_canonical_source_status_overrides(&normalized, status);
+    }
+
+    /// [`Self::set_source_status_overrides`] for paths that are already
+    /// canonical, such as the output of `expand_source_files`. Marking a big
+    /// folder otherwise canonicalized every file a second time — a `readlink`
+    /// per path component, per file, on what is usually a network mount.
+    pub fn set_canonical_source_status_overrides(
+        &self,
+        source_paths: &[PathBuf],
+        status: Option<&str>,
+    ) {
         let normalized: Vec<String> = source_paths
             .iter()
-            .map(|p| canonical_or_normalized(p).to_string_lossy().to_string())
+            .map(|p| p.to_string_lossy().to_string())
             .collect();
         if normalized.is_empty() {
             return;
@@ -570,22 +595,26 @@ impl Database {
                 return;
             }
         };
+        // One prepared statement for the batch: `execute` compiles the SQL
+        // again on every call.
         match status {
             None => {
-                for path in &normalized {
-                    let _ = tx.execute(
-                        "DELETE FROM source_status_overrides WHERE source_path = ?1",
-                        params![path],
-                    );
+                if let Ok(mut stmt) =
+                    tx.prepare("DELETE FROM source_status_overrides WHERE source_path = ?1")
+                {
+                    for path in &normalized {
+                        let _ = stmt.execute(params![path]);
+                    }
                 }
             }
             Some(status) => {
-                for path in &normalized {
-                    let _ = tx.execute(
-                        "INSERT INTO source_status_overrides (source_path, status) VALUES (?1, ?2)
-                         ON CONFLICT(source_path) DO UPDATE SET status = excluded.status, updated_at = CURRENT_TIMESTAMP",
-                        params![path, status],
-                    );
+                if let Ok(mut stmt) = tx.prepare(
+                    "INSERT INTO source_status_overrides (source_path, status) VALUES (?1, ?2)
+                     ON CONFLICT(source_path) DO UPDATE SET status = excluded.status, updated_at = CURRENT_TIMESTAMP",
+                ) {
+                    for path in &normalized {
+                        let _ = stmt.execute(params![path, status]);
+                    }
                 }
             }
         }
@@ -618,7 +647,11 @@ impl Database {
 
     /// Insert/refresh discovered library files for one media type in a single
     /// transaction. Far cheaper than one autocommit per file during a rescan.
-    pub fn upsert_discovered_files(&self, media_type: &str, paths: &[PathBuf]) {
+    ///
+    /// The files arrive already stat'd: stat'ing here would hold the connection
+    /// lock (and an open write transaction) across one filesystem round trip per
+    /// file, stalling every other request for the length of the rescan.
+    pub fn upsert_discovered_files(&self, media_type: &str, files: &[DiscoveredFile]) {
         let mut conn = self.lock();
         let tx = match conn.transaction() {
             Ok(tx) => tx,
@@ -634,30 +667,44 @@ impl Database {
                 Ok(stmt) => stmt,
                 Err(_) => return,
             };
-            for path in paths {
-                if let Some((size, mtime)) = crate::filesystem::size_and_mtime(path) {
-                    let _ = stmt.execute(params![media_type, path.to_string_lossy(), size, mtime]);
-                }
+            for file in files {
+                let _ = stmt.execute(params![
+                    media_type,
+                    file.path.to_string_lossy(),
+                    file.size,
+                    file.mtime
+                ]);
             }
         }
         let _ = tx.commit();
     }
 
-    pub fn mark_missing_outside(&self, roots: &HashMap<String, PathBuf>) {
+    /// Mark library rows under a configured root whose file is gone.
+    ///
+    /// `seen` holds every path the rescan just found on disk: those rows are
+    /// present by construction and are skipped outright, so only the rest —
+    /// in practice the missing files, plus rows stored under a non-canonical
+    /// spelling — cost a filesystem check. Previously every row was
+    /// canonicalized (along with its root, again per row) and stat'd.
+    pub fn mark_missing_outside(&self, roots: &HashMap<String, PathBuf>, seen: &HashSet<String>) {
         let rows = self.list_library_files();
+        let canonical_roots: HashMap<&str, PathBuf> = roots
+            .iter()
+            .map(|(media_type, root)| (media_type.as_str(), canonical_or_normalized(root)))
+            .collect();
 
-        // Decide which rows are missing BEFORE taking the connection lock.
-        // `is_relative_to` canonicalizes both paths and `exists` stats — three
-        // syscalls per file. Doing that under the lock (and inside an open write
-        // transaction) stalls every other request on a large library, and the
-        // media usually lives on a network mount where each call is a round trip.
+        // Decide which rows are missing BEFORE taking the connection lock, so
+        // the filesystem checks never run under it.
         let missing: Vec<i64> = rows
             .into_iter()
+            .filter(|row| row.present && !seen.contains(&row.output_path))
             .filter(|row| {
-                roots.get(&row.media_type).is_some_and(|root| {
-                    let path = PathBuf::from(&row.output_path);
-                    crate::filesystem::is_relative_to(&path, root) && !path.exists()
-                })
+                canonical_roots
+                    .get(row.media_type.as_str())
+                    .is_some_and(|root| {
+                        let path = PathBuf::from(&row.output_path);
+                        canonical_or_normalized(&path).starts_with(root) && !path.exists()
+                    })
             })
             .map(|row| row.id)
             .collect();
