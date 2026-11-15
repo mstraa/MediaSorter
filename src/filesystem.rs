@@ -122,7 +122,7 @@ fn has_extension(path: &Path, extensions: &[&str]) -> bool {
 
 /// Extension check alone, for callers that already know `path` is a file:
 /// `has_extension` would stat it again.
-fn extension_in(path: &Path, extensions: &[&str]) -> bool {
+pub fn extension_in(path: &Path, extensions: &[&str]) -> bool {
     match path.extension() {
         Some(ext) => {
             let ext = ext.to_string_lossy().to_lowercase();
@@ -212,40 +212,6 @@ fn name_lower(path: &Path) -> String {
     path.file_name()
         .map(|n| n.to_string_lossy().to_lowercase())
         .unwrap_or_default()
-}
-
-/// Recursively collect files under `dir` for which `keep` returns true.
-pub fn collect_files(dir: &Path, keep: &dyn Fn(&Path) -> bool, out: &mut Vec<PathBuf>) {
-    let read = match fs::read_dir(dir) {
-        Ok(read) => read,
-        Err(_) => return,
-    };
-    for entry in read.flatten() {
-        let path = entry.path();
-        if is_dir_entry(&entry, &path) {
-            collect_files(&path, keep, out);
-        } else if keep(&path) {
-            out.push(path);
-        }
-    }
-}
-
-/// Whether a directory entry is (or points at) a directory.
-///
-/// `readdir` already reports the type on Linux and macOS, so the common case
-/// costs nothing; only a symlink needs an explicit stat to resolve. Calling
-/// `Path::is_dir()` instead would stat every single entry, and this runs over
-/// the whole tree under each Browse row.
-fn is_dir_entry(entry: &fs::DirEntry, path: &Path) -> bool {
-    match entry.file_type() {
-        // Resolve symlinks so a symlinked show folder is still walked, matching
-        // the previous `Path::is_dir()` behaviour.
-        Ok(file_type) if file_type.is_symlink() => {
-            fs::metadata(path).map(|m| m.is_dir()).unwrap_or(false)
-        }
-        Ok(file_type) => file_type.is_dir(),
-        Err(_) => path.is_dir(),
-    }
 }
 
 /// Recursively collect the regular files under `dir`, already canonical.
@@ -404,7 +370,7 @@ fn push_into_group(
 /// selected files are grouped under their parent folder. Order of first
 /// appearance is preserved; files within a group are sorted by path.
 pub fn expand_grouped(root: &Path, relative_paths: &[String]) -> Result<Vec<FileGroup>, FsError> {
-    expand_grouped_with(root, relative_paths, &is_video_file)
+    expand_grouped_with(root, relative_paths, VIDEO_EXTENSIONS)
 }
 
 /// Like [`expand_grouped`], but collects audio files (for the "music" media
@@ -413,13 +379,13 @@ pub fn expand_grouped_audio(
     root: &Path,
     relative_paths: &[String],
 ) -> Result<Vec<FileGroup>, FsError> {
-    expand_grouped_with(root, relative_paths, &is_audio_file)
+    expand_grouped_with(root, relative_paths, AUDIO_EXTENSIONS)
 }
 
 fn expand_grouped_with(
     root: &Path,
     relative_paths: &[String],
-    keep: &dyn Fn(&Path) -> bool,
+    extensions: &[&str],
 ) -> Result<Vec<FileGroup>, FsError> {
     let root_c = canonical_or_normalized(root);
     let mut order: Vec<String> = Vec::new();
@@ -427,18 +393,24 @@ fn expand_grouped_with(
     let mut seen: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
 
     for relative_path in relative_paths {
+        // Canonical, so the walk below yields canonical paths directly.
         let target = resolve_under_root(root, relative_path)?;
         if target.is_dir() {
             let group_key = relative_path.trim_end_matches('/').to_string();
             let group_name = leaf_name(&target);
+            // One canonical walk: `readdir` already says what each entry is, so
+            // only symlinks cost a syscall. Collecting raw paths with an
+            // `is_file` filter, re-checking each with `is_video_file` and then
+            // canonicalizing it cost two stats plus a `readlink` per path
+            // component for every file — on a network mount, the bulk of a
+            // Match over a big show folder.
             let mut candidates: Vec<PathBuf> = Vec::new();
-            collect_files(&target, &|p| p.is_file(), &mut candidates);
+            collect_canonical_files(&target, &mut candidates);
             candidates.sort();
-            for candidate in candidates {
-                if !keep(&candidate) {
+            for resolved in candidates {
+                if !extension_in(&resolved, extensions) {
                     continue;
                 }
-                let resolved = canonical_or_normalized(&candidate);
                 if !seen.insert(resolved.clone()) {
                     continue;
                 }
@@ -454,8 +426,8 @@ fn expand_grouped_with(
                     },
                 );
             }
-        } else if target.is_file() && keep(&target) {
-            let resolved = canonical_or_normalized(&target);
+        } else if target.is_file() && extension_in(&target, extensions) {
+            let resolved = target;
             if !seen.insert(resolved.clone()) {
                 continue;
             }

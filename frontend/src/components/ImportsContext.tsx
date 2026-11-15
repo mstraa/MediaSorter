@@ -23,11 +23,20 @@ export function ImportsProvider({ children }: { children: ReactNode }) {
   const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const mounted = useRef(true);
 
+  // Last list received, so an unchanged poll (304) still knows whether a job
+  // is active without re-rendering every consumer.
+  const latest = useRef<JobSnapshot[]>([]);
+  const etag = useRef<string | null>(null);
+
   const poll = useCallback(async () => {
     try {
-      const { jobs: next } = await api.listImportJobs();
-      if (mounted.current) setJobs(next);
-      return next.some((job) => job.active);
+      const result = await api.listImportJobs(etag.current);
+      if (result) {
+        latest.current = result.jobs;
+        etag.current = result.etag;
+        if (mounted.current) setJobs(result.jobs);
+      }
+      return latest.current.some((job) => job.active);
     } catch {
       return false;
     }

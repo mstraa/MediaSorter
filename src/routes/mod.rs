@@ -1,8 +1,9 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use axum::extract::{Path as AxumPath, Query, State};
-use axum::http::StatusCode;
+use axum::extract::{DefaultBodyLimit, Path as AxumPath, Query, State};
+use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde_json::{json, Value};
@@ -12,7 +13,7 @@ use crate::db::ImportRow;
 use crate::error::{AppError, AppResult};
 use crate::filesystem::{
     canonical_or_normalized, collect_canonical_files, expand_grouped, expand_grouped_audio,
-    expand_source_files, is_relative_to, list_directory, resolve_under_root,
+    expand_source_files, list_directory, resolve_under_root,
 };
 use crate::formatting::human_file_size;
 use crate::importer::{preview_import, ImportRequest};
@@ -23,6 +24,10 @@ use crate::state::{
     is_valid_action, is_valid_conflict_policy, is_valid_media_type, AppState, MEDIA_TYPES,
     PICKER_ROOTS,
 };
+
+/// Largest request body accepted: room for an import batch of a few hundred
+/// thousand files.
+const MAX_REQUEST_BODY_BYTES: usize = 64 * 1024 * 1024;
 
 pub fn build_router(state: AppState) -> Router {
     let api = Router::new()
@@ -51,6 +56,10 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/episodes", get(episodes))
         .route("/api/source-status", post(source_status))
         .route("/api/folders", get(folders))
+        // axum caps JSON bodies at 2 MB by default. An import or preview batch
+        // carries one ~250-byte entry per file, so selecting more than about
+        // 8,000 files was rejected outright with a 413.
+        .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
         .with_state(state);
 
     api.fallback(static_handler)
@@ -583,9 +592,24 @@ async fn match_route(
     for group in groups {
         if media_type == "film" {
             // Films carry their identity in the filename; one group per file.
-            for gfile in group.files {
-                let mut parsed = parse_film_filename(&gfile.path);
-                parsed.quality = probe_quality_fallback(&gfile.path, &parsed.quality).await;
+            let mut parsed_films: Vec<ParsedMedia> = group
+                .files
+                .iter()
+                .map(|gfile| parse_film_filename(&gfile.path))
+                .collect();
+            let qualities = probe_quality_fallbacks(
+                group
+                    .files
+                    .iter()
+                    .zip(&parsed_films)
+                    .map(|(gfile, parsed)| (gfile.path.clone(), parsed.quality.clone()))
+                    .collect(),
+            )
+            .await;
+            for (parsed, quality) in parsed_films.iter_mut().zip(qualities) {
+                parsed.quality = quality;
+            }
+            for (gfile, parsed) in group.files.into_iter().zip(parsed_films) {
                 let enriched = enrich_film(&state, &parsed, &mut search_cache).await;
                 out_groups.push(MatchGroup {
                     group_key: gfile.path.to_string_lossy().to_string(),
@@ -645,9 +669,25 @@ async fn build_music_groups(groups: Vec<crate::filesystem::FileGroup>) -> Vec<Ma
     let mut order: Vec<(String, String)> = Vec::new();
     let mut by_album: HashMap<(String, String), MusicAlbumAccum> = HashMap::new();
 
+    // Probe every track up front, several at a time (see PROBE_CONCURRENCY),
+    // instead of one ffprobe round trip after another.
+    let paths: Vec<PathBuf> = groups
+        .iter()
+        .flat_map(|group| group.files.iter().map(|f| f.path.clone()))
+        .collect();
+    let mut all_tags = tokio::task::spawn_blocking(move || {
+        crate::ffprobe::map_parallel(&paths, crate::ffprobe::PROBE_CONCURRENCY, |p| {
+            crate::ffprobe::probe_music_tags(p)
+        })
+    })
+    .await
+    .unwrap_or_default()
+    .into_iter();
+
     for group in groups {
         for gfile in &group.files {
-            let (parsed, probed) = resolve_music_track(&gfile.path).await;
+            let tags = all_tags.next().unwrap_or_default();
+            let (parsed, probed) = resolve_music_track(&gfile.path, tags);
             if probed {
                 ffprobe_seen = true;
             }
@@ -722,11 +762,10 @@ struct MusicAlbumAccum {
 /// `format` tags, then falls back to the `<Artist>/<Album>` folder convention
 /// and the filename. Returns the parsed values and whether ffprobe produced any
 /// usable tag (used to surface a "ffprobe missing" note).
-async fn resolve_music_track(path: &Path) -> (crate::parser::ParsedMusic, bool) {
-    let probe_path = path.to_path_buf();
-    let tags = tokio::task::spawn_blocking(move || crate::ffprobe::probe_music_tags(&probe_path))
-        .await
-        .unwrap_or_default();
+fn resolve_music_track(
+    path: &Path,
+    tags: crate::ffprobe::MusicTags,
+) -> (crate::parser::ParsedMusic, bool) {
     let probed = tags.artist.is_some() || tags.album.is_some() || tags.year.is_some();
 
     // Folder fallback: parent dir is the album, grandparent is the artist.
@@ -755,16 +794,28 @@ async fn resolve_music_track(path: &Path) -> (crate::parser::ParsedMusic, bool) 
     (parsed, probed)
 }
 
-/// Resolve quality via ffprobe for a single file when the filename lacked a token.
-async fn probe_quality_fallback(path: &Path, current: &str) -> String {
-    if current != "Unknown" {
-        return current.to_string();
+/// Resolve quality via ffprobe for every file whose filename lacked a quality
+/// token, several probes at a time. `items` pairs each path with the quality
+/// parsed from its name; the result is the final quality for each, in order.
+async fn probe_quality_fallbacks(items: Vec<(PathBuf, String)>) -> Vec<String> {
+    let fallback: Vec<String> = items.iter().map(|(_, q)| q.clone()).collect();
+    if !items.iter().any(|(_, q)| q == "Unknown") {
+        return fallback;
     }
-    let probe_path = path.to_path_buf();
-    match tokio::task::spawn_blocking(move || crate::ffprobe::probe_quality(&probe_path)).await {
-        Ok(Some(quality)) => quality,
-        _ => current.to_string(),
-    }
+    tokio::task::spawn_blocking(move || {
+        crate::ffprobe::map_parallel(
+            &items,
+            crate::ffprobe::PROBE_CONCURRENCY,
+            |(path, current)| {
+                if current != "Unknown" {
+                    return current.clone();
+                }
+                crate::ffprobe::probe_quality(path).unwrap_or_else(|| current.clone())
+            },
+        )
+    })
+    .await
+    .unwrap_or(fallback)
 }
 
 #[derive(Clone)]
@@ -843,13 +894,30 @@ async fn enrich_group(
         .unwrap_or_else(|| folder_title.clone());
     let show_year = selected.as_ref().and_then(|c| c.year).or(folder_year);
 
-    let mut out_episodes = Vec::new();
-    for gfile in &group.files {
-        let segments: Vec<&str> = gfile.relative_segments.iter().map(|s| s.as_str()).collect();
-        let season_hint = crate::parser::season_from_segments(&segments);
-        let mut parsed = crate::parser::parse_folder_episode(&gfile.path, &show_title, season_hint);
-        parsed.quality = probe_quality_fallback(&gfile.path, &parsed.quality).await;
+    let mut parsed_files: Vec<ParsedMedia> = group
+        .files
+        .iter()
+        .map(|gfile| {
+            let segments: Vec<&str> = gfile.relative_segments.iter().map(|s| s.as_str()).collect();
+            let season_hint = crate::parser::season_from_segments(&segments);
+            crate::parser::parse_folder_episode(&gfile.path, &show_title, season_hint)
+        })
+        .collect();
+    let qualities = probe_quality_fallbacks(
+        group
+            .files
+            .iter()
+            .zip(&parsed_files)
+            .map(|(gfile, parsed)| (gfile.path.clone(), parsed.quality.clone()))
+            .collect(),
+    )
+    .await;
+    for (parsed, quality) in parsed_files.iter_mut().zip(qualities) {
+        parsed.quality = quality;
+    }
 
+    let mut out_episodes = Vec::new();
+    for (gfile, parsed) in group.files.iter().zip(parsed_files) {
         let episode_title = episodes
             .iter()
             .find(|e| e.season == parsed.season && e.episode == parsed.episode)
@@ -1006,14 +1074,44 @@ fn snapshot_json(job: &crate::jobs::Job) -> Value {
     serde_json::to_value(job.snapshot()).unwrap_or_else(|_| json!({}))
 }
 
-async fn list_import_jobs(State(state): State<AppState>) -> AppResult<Json<Value>> {
+/// The job list, with an `ETag` so the 1 s / 4 s poll from every page can be
+/// answered with an empty `304 Not Modified` while nothing changed.
+///
+/// The list carries every file of up to 20 finished jobs; re-sending (and
+/// re-parsing, and re-rendering) all of it every few seconds while idle was
+/// the app's steadiest background cost. The tag is a hash of the body, so it
+/// changes exactly when the content does.
+async fn list_import_jobs(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    use std::hash::{Hash, Hasher};
+
     let jobs: Vec<Value> = state
         .jobs
         .list()
         .into_iter()
         .map(|job| snapshot_json(&job))
         .collect();
-    Ok(Json(json!({ "jobs": jobs })))
+    let body = json!({ "jobs": jobs }).to_string();
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    body.hash(&mut hasher);
+    let etag = format!("\"{:016x}\"", hasher.finish());
+
+    let matches = headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.split(',').any(|tag| tag.trim() == etag));
+    let mut response = if matches {
+        StatusCode::NOT_MODIFIED.into_response()
+    } else {
+        ([(header::CONTENT_TYPE, "application/json")], body).into_response()
+    };
+    if let Ok(value) = HeaderValue::from_str(&etag) {
+        response.headers_mut().insert(header::ETAG, value);
+    }
+    // Revalidate every time: the client manages the tag itself.
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+    response
 }
 
 async fn clear_import_jobs(State(state): State<AppState>) -> AppResult<Json<Value>> {
@@ -1137,13 +1235,12 @@ fn build_import_requests(state: &AppState, batch: &ImportBatch) -> AppResult<Vec
         AppError::bad_request(format!("No {} output root configured", batch.media_type))
     })?;
 
-    let input_roots: Vec<PathBuf> = state
-        .db
-        .list_input_roots()
-        .into_iter()
-        .map(|r| PathBuf::from(r.path))
-        .collect();
-    let mut requests = Vec::new();
+    // Canonicalized once here rather than per item: `assert_source_allowed`
+    // and `origin_relative_path` used to resolve every root again for every
+    // file (a `readlink` per path component each time), plus the already
+    // canonical source a second time.
+    let input_roots = canonical_input_roots(state);
+    let mut requests = Vec::with_capacity(batch.items.len());
     for item in &batch.items {
         let source = canonical_or_normalized(&PathBuf::from(&item.source_path));
         assert_source_allowed(&source, &input_roots)?;
@@ -1172,14 +1269,24 @@ fn build_import_requests(state: &AppState, batch: &ImportBatch) -> AppResult<Vec
 /// it (folder structure preserved), e.g. "Spiderman/Saison 01/episode-01.mkv".
 /// Falls back to just the file name when no root matches or stripping yields an
 /// empty path.
+/// The configured input roots, canonicalized.
+fn canonical_input_roots(state: &AppState) -> Vec<PathBuf> {
+    state
+        .db
+        .list_input_roots()
+        .into_iter()
+        .map(|r| canonical_or_normalized(Path::new(&r.path)))
+        .collect()
+}
+
+/// `source` and `input_roots` must both be canonical.
 fn origin_relative_path(source: &Path, input_roots: &[PathBuf]) -> String {
     let file_name = source
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_default();
     for root in input_roots {
-        let root = canonical_or_normalized(root);
-        if let Ok(rel) = source.strip_prefix(&root) {
+        if let Ok(rel) = source.strip_prefix(root) {
             let rel = rel.to_string_lossy().to_string();
             if !rel.is_empty() {
                 return rel;
@@ -1189,8 +1296,10 @@ fn origin_relative_path(source: &Path, input_roots: &[PathBuf]) -> String {
     file_name
 }
 
+/// `source` and `input_roots` must both be canonical (see
+/// [`canonical_input_roots`]), so this is a plain prefix check with no syscall.
 fn assert_source_allowed(source: &Path, input_roots: &[PathBuf]) -> AppResult<()> {
-    if input_roots.iter().any(|root| is_relative_to(source, root)) {
+    if input_roots.iter().any(|root| source.starts_with(root)) {
         Ok(())
     } else {
         Err(AppError::bad_request(format!(
@@ -1292,35 +1401,39 @@ async fn source_status(
     State(state): State<AppState>,
     Json(payload): Json<SourceStatusPayload>,
 ) -> AppResult<Json<Value>> {
-    let sources = status_update_sources(&state, &payload)?;
-    if sources.is_empty() {
-        return Err(AppError::bad_request("No files selected"));
-    }
-    if payload.status == "auto" {
-        state.db.set_source_status_overrides(&sources, None);
-        return Ok(Json(json!({ "status": "auto", "updated": sources.len() })));
-    }
-    if !crate::state::SOURCE_STATUSES.contains(&payload.status.as_str()) {
-        return Err(AppError::bad_request("Invalid status"));
-    }
-    state
-        .db
-        .set_source_status_overrides(&sources, Some(&payload.status));
-    Ok(Json(
-        json!({ "status": payload.status, "updated": sources.len() }),
-    ))
+    // Expanding a folder selection walks every file under it, and the write is
+    // one row per file: on a big folder (on a network mount) that held a Tokio
+    // worker for the whole duration. Same off-runtime treatment as `preview`.
+    blocking(move || {
+        let sources = status_update_sources(&state, &payload)?;
+        if sources.is_empty() {
+            return Err(AppError::bad_request("No files selected"));
+        }
+        if payload.status == "auto" {
+            state
+                .db
+                .set_canonical_source_status_overrides(&sources, None);
+            return Ok(Json(json!({ "status": "auto", "updated": sources.len() })));
+        }
+        if !crate::state::SOURCE_STATUSES.contains(&payload.status.as_str()) {
+            return Err(AppError::bad_request("Invalid status"));
+        }
+        state
+            .db
+            .set_canonical_source_status_overrides(&sources, Some(&payload.status));
+        Ok(Json(
+            json!({ "status": payload.status, "updated": sources.len() }),
+        ))
+    })
+    .await
 }
 
+/// The files a status change applies to, canonical.
 fn status_update_sources(
     state: &AppState,
     payload: &SourceStatusPayload,
 ) -> AppResult<Vec<PathBuf>> {
-    let input_roots: Vec<PathBuf> = state
-        .db
-        .list_input_roots()
-        .into_iter()
-        .map(|r| PathBuf::from(r.path))
-        .collect();
+    let input_roots = canonical_input_roots(state);
     if let Some(source_path) = &payload.source_path {
         let source = canonical_or_normalized(&PathBuf::from(source_path));
         assert_source_allowed(&source, &input_roots)?;
@@ -1352,6 +1465,8 @@ async fn folders(Query(query): Query<FoldersQuery>) -> AppResult<Json<FoldersRes
 
 fn folders_blocking(path: &str) -> AppResult<FoldersResponse> {
     let current = resolve_picker_path(path)?;
+    // `p.is_dir()` follows symlinks, so a dangling link or one to a file is
+    // dropped here; that also makes the old second `metadata` pass redundant.
     let mut children: Vec<PathBuf> = std::fs::read_dir(&current)
         .map_err(|e| AppError::bad_request(e.to_string()))?
         .filter_map(|entry| entry.ok().map(|e| e.path()))
@@ -1365,7 +1480,6 @@ fn folders_blocking(path: &str) -> AppResult<FoldersResponse> {
 
     let folders: Vec<FolderEntry> = children
         .into_iter()
-        .filter(|p| std::fs::metadata(p).is_ok())
         .map(|p| FolderEntry {
             name: p
                 .file_name()

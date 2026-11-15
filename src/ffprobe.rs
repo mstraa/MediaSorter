@@ -27,6 +27,7 @@ fn run_ffprobe(args: &[&str], path: &Path) -> Option<Vec<u8>> {
         .ok()?;
 
     let deadline = Instant::now() + FFPROBE_TIMEOUT;
+    let mut poll = Duration::from_millis(1);
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status,
@@ -40,7 +41,12 @@ fn run_ffprobe(args: &[&str], path: &Path) -> Option<Vec<u8>> {
                     );
                     return None;
                 }
-                std::thread::sleep(Duration::from_millis(20));
+                // Short at first: a probe usually finishes in tens of
+                // milliseconds, and a flat 20 ms poll added up to 20 ms to
+                // every one of them (one per file on a Match). Backs off so a
+                // slow probe does not spin.
+                std::thread::sleep(poll);
+                poll = (poll * 2).min(Duration::from_millis(20));
             }
             Err(_) => return None,
         }
@@ -55,6 +61,52 @@ fn run_ffprobe(args: &[&str], path: &Path) -> Option<Vec<u8>> {
     let mut stdout = Vec::new();
     child.stdout.as_mut()?.read_to_end(&mut stdout).ok()?;
     Some(stdout)
+}
+
+/// How many ffprobe processes a Match runs at once.
+///
+/// Each probe is a process spawn plus a few small reads of the file header,
+/// so it spends nearly all its time waiting on the (often network) disk, not
+/// on the CPU. Run one after another, a 300-track album selection or a show
+/// folder with no quality tag in its filenames took one full round trip per
+/// file. A handful in flight hides that latency without flooding a NAS.
+pub const PROBE_CONCURRENCY: usize = 6;
+
+/// Apply `f` to every item on up to `workers` threads, returning the results
+/// in input order. Blocking: call it from `spawn_blocking`.
+pub fn map_parallel<T, R, F>(items: &[T], workers: usize, f: F) -> Vec<R>
+where
+    T: Sync,
+    R: Send,
+    F: Fn(&T) -> R + Sync,
+{
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
+
+    let workers = workers.clamp(1, items.len().max(1));
+    if workers == 1 {
+        return items.iter().map(&f).collect();
+    }
+    let next = AtomicUsize::new(0);
+    let slots: Vec<Mutex<Option<R>>> = items.iter().map(|_| Mutex::new(None)).collect();
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            scope.spawn(|| loop {
+                let i = next.fetch_add(1, Ordering::Relaxed);
+                let Some(item) = items.get(i) else { break };
+                let result = f(item);
+                *slots[i].lock().unwrap_or_else(|e| e.into_inner()) = Some(result);
+            });
+        }
+    });
+    slots
+        .into_iter()
+        .map(|slot| {
+            slot.into_inner()
+                .unwrap_or_else(|e| e.into_inner())
+                .expect("every slot is filled once the scope joins")
+        })
+        .collect()
 }
 
 /// Audio metadata read from a file's container/format tags via ffprobe.
@@ -184,6 +236,18 @@ fn first_year(value: &str) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn map_parallel_keeps_input_order() {
+        let items: Vec<u64> = (0..100).collect();
+        let out = map_parallel(&items, 6, |n| {
+            // Uneven work so completion order differs from input order.
+            std::thread::sleep(Duration::from_micros((100 - n) * 10));
+            n * 2
+        });
+        assert_eq!(out, (0..100).map(|n| n * 2).collect::<Vec<_>>());
+        assert!(map_parallel(&Vec::<u64>::new(), 6, |n| *n).is_empty());
+    }
 
     #[test]
     fn maps_heights() {

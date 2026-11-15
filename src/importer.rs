@@ -482,7 +482,10 @@ fn copy_with_progress(
     let total = fs::metadata(source)?.len();
     let mut copied: u64 = 0;
     let started_at = Instant::now();
-    let chunk_size = 256 * 1024;
+    // 1 MiB: on SMB/NFS each read and write is a network round trip, and 256 KiB
+    // chunks spent a large share of a copy waiting on them rather than moving
+    // data. It also quarters the progress/cancel lock traffic per file.
+    let chunk_size = 1024 * 1024;
     let bytes_per_second = match copy_rate_limit_mbps {
         Some(limit) if limit > 0.0 => Some(limit * 1024.0 * 1024.0),
         _ => None,
