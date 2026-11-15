@@ -211,4 +211,10 @@ pub struct BrowseQuery {
     pub root_id: Option<i64>,
     #[serde(default)]
     pub path: String,
+    /// Only return entries whose `status_key` is this value ("none", "mixed",
+    /// "imported", ...). Absent or "all" returns everything. With "none", a
+    /// folder the database already proves has a status is dropped without
+    /// walking its files, which is what keeps a mostly-sorted folder fast.
+    #[serde(default)]
+    pub status: Option<String>,
 }

@@ -17,6 +17,17 @@ const SQL_MAX_PARAMS: usize = 500;
 /// same batch does not re-hit the (rate-limited) provider APIs.
 const PROVIDER_CACHE_TTL_HOURS: i64 = 24;
 
+/// `[low, high)` bounds matching every path strictly under directory `prefix`
+/// (canonicalized): `prefix/` up to `prefix0`, since `'0'` is the byte right
+/// after `'/'`. Usable with the `source_path` indexes, unlike `LIKE`.
+fn prefix_range(prefix: &Path) -> (String, String) {
+    let prefix = canonical_or_normalized(prefix)
+        .to_string_lossy()
+        .trim_end_matches('/')
+        .to_string();
+    (format!("{prefix}/"), format!("{prefix}0"))
+}
+
 const SCHEMA: &str = r#"
 PRAGMA foreign_keys = ON;
 
@@ -373,13 +384,24 @@ impl Database {
         &self,
         source_paths: &[PathBuf],
     ) -> HashMap<String, ImportRow> {
-        if source_paths.is_empty() {
-            return HashMap::new();
-        }
         let normalized: Vec<String> = source_paths
             .iter()
             .map(|p| canonical_or_normalized(p).to_string_lossy().to_string())
             .collect();
+        self.latest_imports_for_canonical_sources(&normalized)
+    }
+
+    /// [`Self::latest_imports_for_sources`] for paths that are already
+    /// canonical. Browse has canonical paths for every file it walked, and
+    /// canonicalizing tens of thousands of them again is what made big
+    /// folders slow on network mounts.
+    pub fn latest_imports_for_canonical_sources(
+        &self,
+        normalized: &[String],
+    ) -> HashMap<String, ImportRow> {
+        if normalized.is_empty() {
+            return HashMap::new();
+        }
         let conn = self.lock();
         let mut out = HashMap::new();
         // Chunked: one bound parameter per path would blow SQLITE_MAX_VARIABLE_NUMBER
@@ -412,21 +434,22 @@ impl Database {
     /// files were moved out of the input tree, where they no longer exist to be
     /// listed and matched by `latest_imports_for_sources`.
     pub fn latest_imports_under_prefix(&self, prefix: &Path) -> Vec<ImportRow> {
-        let prefix = canonical_or_normalized(prefix)
-            .to_string_lossy()
-            .to_string();
-        let like = format!("{}/%", escape_like(&prefix));
+        let (low, high) = prefix_range(prefix);
         let conn = self.lock();
+        // A range on the indexed column instead of `LIKE 'prefix/%'`: SQLite's
+        // LIKE is case-insensitive, so it can't use the index and scanned the
+        // whole imports table on every Browse load (and matched folders that
+        // only differ in case).
         let mut stmt = match conn.prepare(
             "SELECT * FROM imports WHERE id IN (
                 SELECT MAX(id) FROM imports
-                WHERE source_path LIKE ?1 ESCAPE '\\' GROUP BY source_path
+                WHERE source_path >= ?1 AND source_path < ?2 GROUP BY source_path
             )",
         ) {
             Ok(stmt) => stmt,
             Err(_) => return Vec::new(),
         };
-        stmt.query_map(params![like], map_import_row)
+        stmt.query_map(params![low, high], map_import_row)
             .map(|iter| iter.filter_map(Result::ok).collect())
             .unwrap_or_default()
     }
@@ -452,17 +475,53 @@ impl Database {
 
     // ---- source status overrides ----
 
+    /// Every status override recorded for a path under `prefix` (a directory).
+    pub fn source_status_overrides_under_prefix(
+        &self,
+        prefix: &Path,
+    ) -> HashMap<String, SourceStatusOverride> {
+        let (low, high) = prefix_range(prefix);
+        let conn = self.lock();
+        let mut stmt = match conn.prepare(
+            "SELECT source_path, status FROM source_status_overrides
+            WHERE source_path >= ?1 AND source_path < ?2",
+        ) {
+            Ok(stmt) => stmt,
+            Err(_) => return HashMap::new(),
+        };
+        stmt.query_map(params![low, high], |row| {
+            Ok(SourceStatusOverride {
+                source_path: row.get(0)?,
+                status: row.get(1)?,
+            })
+        })
+        .map(|iter| {
+            iter.filter_map(Result::ok)
+                .map(|o| (o.source_path.clone(), o))
+                .collect()
+        })
+        .unwrap_or_default()
+    }
+
     pub fn source_status_overrides(
         &self,
         source_paths: &[PathBuf],
     ) -> HashMap<String, SourceStatusOverride> {
-        if source_paths.is_empty() {
-            return HashMap::new();
-        }
         let normalized: Vec<String> = source_paths
             .iter()
             .map(|p| canonical_or_normalized(p).to_string_lossy().to_string())
             .collect();
+        self.source_status_overrides_for_canonical(&normalized)
+    }
+
+    /// [`Self::source_status_overrides`] for paths that are already canonical.
+    pub fn source_status_overrides_for_canonical(
+        &self,
+        normalized: &[String],
+    ) -> HashMap<String, SourceStatusOverride> {
+        if normalized.is_empty() {
+            return HashMap::new();
+        }
         let conn = self.lock();
         let mut out = HashMap::new();
         // Chunked for the same reason as `latest_imports_for_sources`.
@@ -803,15 +862,6 @@ PRAGMA foreign_keys = ON;
     Ok(())
 }
 
-/// Escape the LIKE wildcards (`%`, `_`) and the escape char itself so a path
-/// used as a prefix matches literally. Paired with `ESCAPE '\'` in the query.
-fn escape_like(value: &str) -> String {
-    value
-        .replace('\\', "\\\\")
-        .replace('%', "\\%")
-        .replace('_', "\\_")
-}
-
 fn map_import_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ImportRow> {
     Ok(ImportRow {
         id: row.get("id")?,
@@ -900,10 +950,21 @@ mod tests {
         db.insert_import(&record(&child.to_string_lossy()));
         db.insert_import(&record(&other.to_string_lossy()));
 
+        // Siblings sharing the name as a prefix, and a case variant, stay out.
+        let sibling = base.join("Show 2").join("ep.mkv");
+        let case = base.join("show").join("ep.mkv");
+        db.insert_import(&record(&sibling.to_string_lossy()));
+        db.insert_import(&record(&case.to_string_lossy()));
+
         let rows = db.latest_imports_under_prefix(&base.join("Show"));
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].source_path, child.to_string_lossy());
         assert_eq!(rows[0].result, "imported");
+
+        db.set_source_status_overrides(&[child.clone(), sibling.clone()], Some("skipped"));
+        let overrides = db.source_status_overrides_under_prefix(&base.join("Show"));
+        assert_eq!(overrides.len(), 1);
+        assert!(overrides.contains_key(child.to_string_lossy().as_ref()));
         std::fs::remove_dir_all(&dir).ok();
     }
 

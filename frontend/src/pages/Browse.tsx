@@ -55,7 +55,7 @@ export default function BrowsePage() {
     const seq = ++requestSeq.current;
     progress.startDelayed("Loading folder...");
     api
-      .getBrowse(rootId, path)
+      .getBrowse(rootId, path, statusFilter)
       .then((response) => {
         if (seq !== requestSeq.current) return;
         setData(response);
@@ -68,13 +68,14 @@ export default function BrowsePage() {
       .finally(() => {
         if (seq === requestSeq.current) progress.hide();
       });
-  }, [rootId, path, progress]);
+  }, [rootId, path, statusFilter, progress]);
 
+  // The status filter is applied by the server, so changing it reloads.
   useEffect(() => {
     setSelected(new Set());
     load();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [rootId, path]);
+  }, [rootId, path, statusFilter]);
 
   const visibleEntries = useMemo(() => {
     if (!data) return [];

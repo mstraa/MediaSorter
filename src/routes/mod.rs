@@ -11,8 +11,8 @@ use crate::assets::static_handler;
 use crate::db::ImportRow;
 use crate::error::{AppError, AppResult};
 use crate::filesystem::{
-    canonical_or_normalized, expand_grouped, expand_grouped_audio, expand_source_files,
-    is_relative_to, list_directory, resolve_under_root,
+    canonical_or_normalized, collect_canonical_files, expand_grouped, expand_grouped_audio,
+    expand_source_files, is_relative_to, list_directory, resolve_under_root,
 };
 use crate::formatting::human_file_size;
 use crate::importer::{preview_import, ImportRequest};
@@ -184,9 +184,12 @@ async fn browse(
         Some(root) => {
             let task_state = state.clone();
             let path = query.path.clone();
-            tokio::task::spawn_blocking(move || browse_directory(&task_state, &root, &path))
-                .await
-                .unwrap_or_else(|e| (Vec::new(), Some(e.to_string()), String::new()))
+            let status = query.status.clone().filter(|s| s != "all");
+            tokio::task::spawn_blocking(move || {
+                browse_directory(&task_state, &root, &path, status.as_deref())
+            })
+            .await
+            .unwrap_or_else(|e| (Vec::new(), Some(e.to_string()), String::new()))
         }
         // Distinguish "no input roots configured yet" (nothing to say) from
         // "the requested root_id does not exist" — a stale bookmark or a root
@@ -208,12 +211,14 @@ async fn browse(
 }
 
 /// List one directory of an input root and compute each entry's import status.
+/// With `status_filter`, only entries whose `status_key` matches are returned.
 /// Returns `(entries, error, parent_path)`. Synchronous (filesystem + SQLite),
 /// so callers run it via `spawn_blocking`.
 fn browse_directory(
     state: &AppState,
     root: &crate::db::InputRoot,
     rel_path: &str,
+    status_filter: Option<&str>,
 ) -> (Vec<BrowseEntry>, Option<String>, String) {
     let root_path = PathBuf::from(&root.path);
     let listed = match list_directory(&root_path, rel_path) {
@@ -237,48 +242,71 @@ fn browse_directory(
     // were imported. Fetch every such record under the *current* directory in
     // one query, then bucket them by the child folder they belong to (one scan
     // instead of one per child).
-    let moved_by_child = bucket_moved_imports(state, &root_path, rel_path, &listed);
+    let root_c = canonical_or_normalized(&root_path);
+    let current_dir = resolve_under_root(&root_path, rel_path).ok();
+    let children = ChildDirs::new(current_dir.as_deref(), &listed);
+    let imports_by_child = bucket_imports_by_child(state, current_dir.as_deref(), &children);
 
-    // Map each entry to the set of source files it covers.
-    let mut entry_sources: HashMap<String, Vec<PathBuf>> = HashMap::new();
-    let mut all_sources: Vec<PathBuf> = Vec::new();
+    // "Only no status" view: a folder holding even one file with a status is
+    // "mixed" or that status, never "none". The database already says which
+    // folders those are, so skip them before walking their (possibly huge)
+    // trees. Only folders with nothing recorded, or only "none" overrides,
+    // still get walked.
+    let skip_dirs: HashSet<String> = if status_filter == Some("none") {
+        let overrides_here = current_dir
+            .as_deref()
+            .map(|dir| state.db.source_status_overrides_under_prefix(dir))
+            .unwrap_or_default();
+        dirs_with_known_status(&children, &imports_by_child, &overrides_here)
+    } else {
+        HashSet::new()
+    };
+
+    // Map each entry to the set of source files it covers. Every path here is
+    // canonical already, so the lookups below use them as-is.
+    let mut entry_sources: HashMap<String, Vec<String>> = HashMap::new();
+    let mut all_sources: Vec<String> = Vec::new();
     for entry in &listed {
-        let sources = if entry.is_dir {
-            let mut present =
-                expand_source_files(&root_path, std::slice::from_ref(&entry.relative_path))
-                    .unwrap_or_default();
-            let present_set: std::collections::HashSet<&PathBuf> = present.iter().collect();
-            let moved: Vec<PathBuf> = moved_by_child
-                .get(&entry.relative_path)
-                .map(|paths| {
-                    paths
-                        .iter()
-                        .filter(|p| !present_set.contains(p))
-                        .cloned()
-                        .collect()
-                })
-                .unwrap_or_default();
-            drop(present_set);
-            present.extend(moved);
+        if skip_dirs.contains(&entry.relative_path) {
+            continue;
+        }
+        let sources: Vec<String> = if entry.is_dir {
+            let mut present: Vec<PathBuf> = Vec::new();
+            collect_canonical_files(&entry.canonical_path, &mut present);
+            // A symlink can lead out of the input root; the import handler
+            // rejects those, so they don't count towards the folder.
+            present.retain(|p| p.starts_with(&root_c));
+            let mut present: Vec<String> = present
+                .into_iter()
+                .map(|p| p.to_string_lossy().into_owned())
+                .collect();
+            let present_set: HashSet<String> = present.iter().cloned().collect();
+            if let Some(rows) = imports_by_child.get(&entry.relative_path) {
+                present.extend(
+                    rows.iter()
+                        .filter(|r| !present_set.contains(&r.source_path))
+                        .map(|r| r.source_path.clone()),
+                );
+            }
             present
         } else {
-            vec![canonical_or_normalized(&entry.absolute_path)]
+            vec![entry.canonical_path.to_string_lossy().into_owned()]
         };
-        for s in &sources {
-            all_sources.push(s.clone());
-        }
+        all_sources.extend(sources.iter().cloned());
         entry_sources.insert(entry.relative_path.clone(), sources);
     }
-    let imports = state.db.latest_imports_for_sources(&all_sources);
-    let overrides = state.db.source_status_overrides(&all_sources);
+    let imports = state.db.latest_imports_for_canonical_sources(&all_sources);
+    let overrides = state.db.source_status_overrides_for_canonical(&all_sources);
 
     let mut entries = Vec::new();
     for entry in listed {
-        let sources = entry_sources
-            .get(&entry.relative_path)
-            .cloned()
-            .unwrap_or_default();
-        let status = compute_browse_status(&sources, &imports, &overrides);
+        let Some(sources) = entry_sources.get(&entry.relative_path) else {
+            continue; // skipped above: known to have a status
+        };
+        let status = compute_browse_status(sources, &imports, &overrides);
+        if status_filter.is_some_and(|f| f != status.status_key) {
+            continue;
+        }
         entries.push(BrowseEntry {
             name: entry.name,
             relative_path: entry.relative_path,
@@ -300,6 +328,96 @@ fn browse_directory(
     (entries, None, parent_relative(rel_path))
 }
 
+/// The listed child folders of the current directory, to find which one a
+/// recorded path lies under without comparing it against every folder.
+struct ChildDirs<'a> {
+    current_dir: Option<&'a Path>,
+    /// canonical folder path -> listed relative path
+    by_path: HashMap<&'a Path, &'a String>,
+    /// Folders whose canonical path is not `current_dir/name` (symlinks).
+    elsewhere: Vec<(&'a Path, &'a String)>,
+}
+
+impl<'a> ChildDirs<'a> {
+    fn new(current_dir: Option<&'a Path>, listed: &'a [crate::filesystem::BrowserEntry]) -> Self {
+        let mut by_path = HashMap::new();
+        let mut elsewhere = Vec::new();
+        for e in listed.iter().filter(|e| e.is_dir) {
+            let direct = current_dir.is_some_and(|d| e.canonical_path.parent() == Some(d));
+            if direct {
+                by_path.insert(e.canonical_path.as_path(), &e.relative_path);
+            } else {
+                elsewhere.push((e.canonical_path.as_path(), &e.relative_path));
+            }
+        }
+        Self {
+            current_dir,
+            by_path,
+            elsewhere,
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.by_path.is_empty() && self.elsewhere.is_empty()
+    }
+
+    /// Relative path of the listed folder containing `path`, if any.
+    fn containing(&self, path: &Path) -> Option<&'a String> {
+        if let Some(dir) = self.current_dir {
+            if let Some(first) = path
+                .strip_prefix(dir)
+                .ok()
+                .and_then(|r| r.components().next())
+            {
+                if let Some(rel) = self.by_path.get(dir.join(first).as_path()) {
+                    return Some(rel);
+                }
+            }
+        }
+        self.elsewhere
+            .iter()
+            .find(|(prefix, _)| path.starts_with(prefix))
+            .map(|(_, rel)| *rel)
+    }
+}
+
+/// Listed folders that certainly have a status, decided from the database
+/// alone: some import under the folder resolves to a status (its override
+/// wins), or a file under it that still exists carries a non-"none" override.
+/// Such a folder's aggregate is that status or "mixed", never "none".
+fn dirs_with_known_status(
+    children: &ChildDirs<'_>,
+    imports_by_child: &HashMap<String, Vec<ImportRow>>,
+    overrides_here: &HashMap<String, crate::db::SourceStatusOverride>,
+) -> HashSet<String> {
+    let mut known = HashSet::new();
+    for (rel, rows) in imports_by_child {
+        let has_status = rows
+            .iter()
+            .any(|row| match overrides_here.get(&row.source_path) {
+                Some(o) => o.status != "none",
+                None => true, // every import row carries a result
+            });
+        if has_status {
+            known.insert(rel.clone());
+        }
+    }
+    for (path, o) in overrides_here {
+        if o.status == "none" {
+            continue;
+        }
+        let path = Path::new(path);
+        if let Some(rel) = children.containing(path) {
+            // An override only counts for a file still on disk: one stat, and
+            // only until the folder is known.
+            if !known.contains(rel) && path.is_file() {
+                known.insert(rel.clone());
+            }
+        }
+    }
+    known
+}
+
 struct BrowseStatus {
     status: Option<String>,
     status_key: String,
@@ -308,16 +426,14 @@ struct BrowseStatus {
     source_count: usize,
 }
 
+/// `source` must be canonical: it is looked up as-is.
 fn source_status_for_path(
-    source: &Path,
+    source: &str,
     imports: &HashMap<String, ImportRow>,
     overrides: &HashMap<String, crate::db::SourceStatusOverride>,
 ) -> (Option<String>, String, Option<String>) {
-    let key = canonical_or_normalized(source)
-        .to_string_lossy()
-        .to_string();
-    let override_status = overrides.get(&key);
-    let latest = imports.get(&key);
+    let override_status = overrides.get(source);
+    let latest = imports.get(source);
     let status = if let Some(o) = override_status {
         if o.status == "none" {
             None
@@ -335,7 +451,7 @@ fn source_status_for_path(
 }
 
 fn compute_browse_status(
-    sources: &[PathBuf],
+    sources: &[String],
     imports: &HashMap<String, ImportRow>,
     overrides: &HashMap<String, crate::db::SourceStatusOverride>,
 ) -> BrowseStatus {
@@ -389,41 +505,26 @@ fn compute_browse_status(
     }
 }
 
-/// Group moved-away import source paths by the listed child folder they belong
-/// to. One prefix query over the current directory replaces one query per
-/// child. Files moved directly out of the current directory (not from a child
-/// folder) are intentionally dropped: they are gone and not listed.
-fn bucket_moved_imports(
+/// Latest import row for every source under the current directory, grouped by
+/// the listed child folder it belongs to. One prefix query over the current
+/// directory replaces one query per child. Rows for files directly in the
+/// current directory (not in a child folder) are dropped: listed files are
+/// looked up by path, and moved-away ones are gone and not listed.
+fn bucket_imports_by_child(
     state: &AppState,
-    root_path: &Path,
-    rel_path: &str,
-    listed: &[crate::filesystem::BrowserEntry],
-) -> HashMap<String, Vec<PathBuf>> {
-    let mut buckets: HashMap<String, Vec<PathBuf>> = HashMap::new();
-    let current_dir = match resolve_under_root(root_path, rel_path) {
-        Ok(dir) => dir,
-        Err(_) => return buckets,
+    current_dir: Option<&Path>,
+    children: &ChildDirs<'_>,
+) -> HashMap<String, Vec<ImportRow>> {
+    let mut buckets: HashMap<String, Vec<ImportRow>> = HashMap::new();
+    let Some(current_dir) = current_dir else {
+        return buckets;
     };
-    let dir_children: Vec<(String, PathBuf)> = listed
-        .iter()
-        .filter(|e| e.is_dir)
-        .map(|e| {
-            (
-                e.relative_path.clone(),
-                canonical_or_normalized(&e.absolute_path),
-            )
-        })
-        .collect();
-    if dir_children.is_empty() {
+    if children.is_empty() {
         return buckets;
     }
-    for row in state.db.latest_imports_under_prefix(&current_dir) {
-        let path = PathBuf::from(row.source_path);
-        if let Some((rel, _)) = dir_children
-            .iter()
-            .find(|(_, prefix)| path.starts_with(prefix))
-        {
-            buckets.entry(rel.clone()).or_default().push(path);
+    for row in state.db.latest_imports_under_prefix(current_dir) {
+        if let Some(rel) = children.containing(Path::new(&row.source_path)) {
+            buckets.entry(rel.clone()).or_default().push(row);
         }
     }
     buckets

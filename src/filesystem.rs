@@ -24,6 +24,9 @@ pub struct BrowserEntry {
     pub name: String,
     pub relative_path: String,
     pub absolute_path: PathBuf,
+    /// Symlink-resolved absolute path, computed once by [`list_directory`] so
+    /// callers never `canonicalize` the same entry again.
+    pub canonical_path: PathBuf,
     pub is_dir: bool,
     pub size: Option<i64>,
     pub is_video: bool,
@@ -114,9 +117,12 @@ pub fn size_and_mtime(path: &Path) -> Option<(i64, Option<f64>)> {
 }
 
 fn has_extension(path: &Path, extensions: &[&str]) -> bool {
-    if !path.is_file() {
-        return false;
-    }
+    path.is_file() && extension_in(path, extensions)
+}
+
+/// Extension check alone, for callers that already know `path` is a file:
+/// `has_extension` would stat it again.
+fn extension_in(path: &Path, extensions: &[&str]) -> bool {
     match path.extension() {
         Some(ext) => {
             let ext = ext.to_string_lossy().to_lowercase();
@@ -146,24 +152,34 @@ pub fn list_directory(root: &Path, relative_path: &str) -> Result<Vec<BrowserEnt
     // `Path::is_dir()` / `name_lower()` instead would re-stat and re-allocate
     // inside the comparator — O(n log n) syscalls over a directory that may sit
     // on a network mount, versus O(n) here.
-    let mut children: Vec<(bool, String, PathBuf, fs::Metadata)> = read
+    //
+    // `directory` is canonical (from `resolve_under_root`), so a child that is
+    // not a symlink is canonical as `directory/name` with no extra syscall.
+    // Only symlinks need `canonicalize`, which costs one `readlink` per path
+    // component and dominated large listings.
+    let mut children: Vec<(bool, String, PathBuf, PathBuf, fs::Metadata)> = read
         .filter_map(|entry| entry.ok())
         .filter_map(|entry| {
             let path = entry.path();
+            let is_symlink = entry.file_type().map(|t| t.is_symlink()).unwrap_or(true);
             // `metadata` (not `entry.file_type()`) so symlinks resolve, matching
             // how the entries are classified below.
             let meta = fs::metadata(&path).ok()?;
-            Some((meta.is_dir(), name_lower(&path), path, meta))
+            let canonical = if is_symlink {
+                canonical_or_normalized(&path)
+            } else {
+                path.clone()
+            };
+            Some((meta.is_dir(), name_lower(&path), path, canonical, meta))
         })
         .collect();
     // Folders first, then case-insensitive name.
-    children.sort_by(|(a_dir, a_name, _, _), (b_dir, b_name, _, _)| {
+    children.sort_by(|(a_dir, a_name, ..), (b_dir, b_name, ..)| {
         (!a_dir).cmp(&!b_dir).then_with(|| a_name.cmp(b_name))
     });
 
     let mut entries = Vec::with_capacity(children.len());
-    for (_, _, child, metadata) in children {
-        let child_c = canonical_or_normalized(&child);
+    for (_, _, child, child_c, metadata) in children {
         let relative = match child_c.strip_prefix(&root_c) {
             Ok(rel) => rel.to_string_lossy().to_string(),
             Err(_) => continue,
@@ -177,13 +193,14 @@ pub fn list_directory(root: &Path, relative_path: &str) -> Result<Vec<BrowserEnt
                 .unwrap_or_default(),
             relative_path: relative,
             absolute_path: child.clone(),
+            is_video: metadata.is_file() && extension_in(&child, VIDEO_EXTENSIONS),
+            canonical_path: child_c,
             is_dir,
             size: if is_dir {
                 None
             } else {
                 Some(metadata.len() as i64)
             },
-            is_video: is_video_file(&child),
             has_extra_links,
             dev_inode: if is_dir { None } else { dev_inode(&metadata) },
         });
@@ -231,6 +248,55 @@ fn is_dir_entry(entry: &fs::DirEntry, path: &Path) -> bool {
     }
 }
 
+/// Recursively collect the regular files under `dir`, already canonical.
+///
+/// `dir` must be canonical. A child reached through plain directories is then
+/// canonical as `dir/name` by construction, so only symlinks are resolved —
+/// unlike collecting raw paths and calling `canonicalize` on each, which costs
+/// a `readlink` per path component per file. Symlinked directories are walked
+/// through their canonical path, once each, so a symlink loop terminates.
+pub fn collect_canonical_files(dir: &Path, out: &mut Vec<PathBuf>) {
+    let mut visited = std::collections::HashSet::new();
+    visited.insert(dir.to_path_buf());
+    walk_canonical(dir, out, &mut visited);
+}
+
+fn walk_canonical(
+    dir: &Path,
+    out: &mut Vec<PathBuf>,
+    visited: &mut std::collections::HashSet<PathBuf>,
+) {
+    let read = match fs::read_dir(dir) {
+        Ok(read) => read,
+        Err(_) => return,
+    };
+    for entry in read.flatten() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        let path = entry.path();
+        if file_type.is_symlink() {
+            let Ok(meta) = fs::metadata(&path) else {
+                continue; // dangling link
+            };
+            let Ok(resolved) = fs::canonicalize(&path) else {
+                continue;
+            };
+            if meta.is_dir() {
+                if visited.insert(resolved.clone()) {
+                    walk_canonical(&resolved, out, visited);
+                }
+            } else if meta.is_file() {
+                out.push(resolved);
+            }
+        } else if file_type.is_dir() {
+            walk_canonical(&path, out, visited);
+        } else if file_type.is_file() {
+            out.push(path);
+        }
+    }
+}
+
 fn expand_files(
     root: &Path,
     relative_paths: &[String],
@@ -240,27 +306,29 @@ fn expand_files(
     let mut seen: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
     let root_c = canonical_or_normalized(root);
     for relative_path in relative_paths {
+        // Canonical, so the walk below yields canonical paths without a
+        // per-file `canonicalize`.
         let target = resolve_under_root(root, relative_path)?;
         let mut candidates: Vec<PathBuf> = Vec::new();
         if target.is_dir() {
-            collect_files(&target, &|p| p.is_file(), &mut candidates);
-        } else {
+            collect_canonical_files(&target, &mut candidates);
+        } else if target.is_file() {
             candidates.push(target);
         }
         for candidate in candidates {
-            if candidate.is_file() && (!video_only || is_video_file(&candidate)) {
-                let resolved = canonical_or_normalized(&candidate);
-                // A symlink inside the root can point outside it. Browse already
-                // hides those (their canonical path will not strip_prefix the
-                // root) and the import handler rejects them, so expanding them
-                // here only produced a confusing whole-batch failure — and
-                // following them would otherwise reach outside the input root.
-                if !resolved.starts_with(&root_c) {
-                    continue;
-                }
-                if seen.insert(resolved.clone()) {
-                    files.push(resolved);
-                }
+            if video_only && !extension_in(&candidate, VIDEO_EXTENSIONS) {
+                continue;
+            }
+            // A symlink inside the root can point outside it. Browse already
+            // hides those (their canonical path will not strip_prefix the
+            // root) and the import handler rejects them, so expanding them
+            // here only produced a confusing whole-batch failure — and
+            // following them would otherwise reach outside the input root.
+            if !candidate.starts_with(&root_c) {
+                continue;
+            }
+            if seen.insert(candidate.clone()) {
+                files.push(candidate);
             }
         }
     }
@@ -532,6 +600,52 @@ mod tests {
             "in-root symlinked folder should still be walked: {files:?}"
         );
 
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// The walk returns canonical paths without canonicalizing each file, and
+    /// a symlink pointing back up the tree does not loop forever.
+    #[test]
+    #[cfg(unix)]
+    fn canonical_walk_resolves_symlinks_and_stops_on_loops() {
+        let base = std::env::temp_dir().join(format!("tvsorter-walk-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(base.join("Show/Season 1")).unwrap();
+        fs::create_dir_all(base.join("Elsewhere")).unwrap();
+        File::create(base.join("Show/Season 1/ep1.mkv")).unwrap();
+        File::create(base.join("Elsewhere/ep2.mkv")).unwrap();
+        std::os::unix::fs::symlink(base.join("Elsewhere"), base.join("Show/Season 2")).unwrap();
+        std::os::unix::fs::symlink(base.join("Show"), base.join("Show/Season 1/loop")).unwrap();
+
+        let show = canonical_or_normalized(&base.join("Show"));
+        let mut files = Vec::new();
+        collect_canonical_files(&show, &mut files);
+        files.sort();
+        let base_c = canonical_or_normalized(&base);
+        assert_eq!(
+            files,
+            vec![
+                base_c.join("Elsewhere/ep2.mkv"),
+                base_c.join("Show/Season 1/ep1.mkv"),
+            ]
+        );
+        for f in &files {
+            assert_eq!(&canonical_or_normalized(f), f);
+        }
+
+        fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn listing_reports_canonical_paths() {
+        let root = std::env::temp_dir().join(format!("tvsorter-list-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(root.join("Show")).unwrap();
+        File::create(root.join("film.mkv")).unwrap();
+        let entries = list_directory(&root, "").unwrap();
+        for e in &entries {
+            assert_eq!(e.canonical_path, canonical_or_normalized(&e.absolute_path));
+        }
+        let film = entries.iter().find(|e| e.name == "film.mkv").unwrap();
+        assert!(film.is_video && !film.is_dir);
         fs::remove_dir_all(&root).ok();
     }
 }
