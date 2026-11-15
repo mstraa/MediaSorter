@@ -86,6 +86,44 @@ fn clamp_backoff(secs: f64) -> Duration {
     Duration::from_secs_f64(secs.min(MAX_BACKOFF_SECS))
 }
 
+/// Describe a reqwest failure by its root cause instead of its outer layer.
+///
+/// reqwest's `Display` stops at "error sending request for url (...)", which
+/// hides whether it was a timeout, a DNS failure, a TLS error or a reset
+/// connection, and leaks the full query URL into the match queue. Report the
+/// host and the innermost causes instead.
+fn describe_reqwest_error(err: &reqwest::Error) -> String {
+    let host = err
+        .url()
+        .and_then(|u| u.host_str())
+        .unwrap_or("metadata provider")
+        .to_string();
+    if err.is_timeout() {
+        return format!("{host} did not answer in time (timed out)");
+    }
+    let mut causes = Vec::new();
+    let mut source = std::error::Error::source(err);
+    while let Some(cause) = source {
+        let text = cause.to_string();
+        if !text.is_empty() && !causes.contains(&text) {
+            causes.push(text);
+        }
+        source = cause.source();
+    }
+    let what = if err.is_connect() {
+        "could not connect to"
+    } else if err.is_decode() {
+        "unreadable response from"
+    } else {
+        "request failed for"
+    };
+    if causes.is_empty() {
+        format!("{what} {host}")
+    } else {
+        format!("{what} {host}: {}", causes.join(": "))
+    }
+}
+
 #[derive(Clone)]
 pub struct MetadataProviders {
     db: Database,
@@ -96,7 +134,10 @@ pub struct MetadataProviders {
 impl MetadataProviders {
     pub fn new(db: Database) -> Self {
         let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(15))
+            .connect_timeout(Duration::from_secs(10))
+            // Jikan's cold searches can take longer than 15 s while it queries
+            // MyAnimeList; give it room before giving up.
+            .timeout(Duration::from_secs(20))
             .user_agent(USER_AGENT)
             .build()
             .expect("failed to build HTTP client");
@@ -167,14 +208,25 @@ impl MetadataProviders {
     async fn get_json(&self, url: &str) -> Result<Value, ProviderError> {
         let mut last_status = 429u16;
         for attempt in 0..3 {
-            let response = self
+            let response = match self
                 .client
                 .get(url)
                 .header("Accept", "application/json")
                 .header("Api-User-Agent", USER_AGENT)
                 .send()
                 .await
-                .map_err(|e| ProviderError::Http(e.to_string()))?;
+            {
+                Ok(response) => response,
+                // Jikan regularly drops or stalls a connection under load
+                // (it proxies MyAnimeList live). A timeout or failed connect
+                // says nothing about the request, so retry it once.
+                Err(err) if attempt == 0 && (err.is_timeout() || err.is_connect()) => {
+                    tracing::warn!(url, error = %describe_reqwest_error(&err), "provider request failed, retrying");
+                    tokio::time::sleep(clamp_backoff(2.0 * (attempt as f64 + 1.0))).await;
+                    continue;
+                }
+                Err(err) => return Err(ProviderError::Http(describe_reqwest_error(&err))),
+            };
             let status = response.status();
             let code = status.as_u16();
             if !is_retriable(code) {
@@ -184,7 +236,7 @@ impl MetadataProviders {
                 return response
                     .json::<Value>()
                     .await
-                    .map_err(|e| ProviderError::Http(e.to_string()));
+                    .map_err(|e| ProviderError::Http(describe_reqwest_error(&e)));
             }
             last_status = code;
             let retry_after = response
@@ -578,4 +630,29 @@ fn year_from_description(description: &str) -> Option<i64> {
         .captures(description)
         .and_then(|caps| caps.get(1))
         .and_then(|m| m.as_str().parse().ok())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn reqwest_error_names_host_and_root_cause() {
+        // Nothing listens on port 1: the connect is refused straight away.
+        let err = reqwest::Client::new()
+            .get("http://127.0.0.1:1/v4/anime?q=secret%20query")
+            .send()
+            .await
+            .unwrap_err();
+        let message = describe_reqwest_error(&err);
+        assert!(
+            message.starts_with("could not connect to 127.0.0.1"),
+            "{message}"
+        );
+        assert!(!message.contains("secret"), "{message}");
+        assert!(
+            message.len() > "could not connect to 127.0.0.1".len(),
+            "{message}"
+        );
+    }
 }
