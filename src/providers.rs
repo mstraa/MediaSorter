@@ -142,8 +142,9 @@ const JIKAN_COOLDOWN: Duration = Duration::from_secs(5 * 60);
 const JIKAN_TIMEOUT: Duration = Duration::from_secs(10);
 
 const ANILIST_SEARCH_QUERY: &str = "query ($search: String) { Page(perPage: 10) { media(search: $search, type: ANIME, sort: SEARCH_MATCH) { id title { romaji english } seasonYear startDate { year } description(asHtml: false) } } }";
-const ANILIST_EPISODES_QUERY: &str =
-    "query ($id: Int) { Media(id: $id, type: ANIME) { idMal streamingEpisodes { title } } }";
+const ANILIST_EPISODES_QUERY: &str = "query ($id: Int) { Media(id: $id, type: ANIME) { idMal title { romaji english } streamingEpisodes { title } } }";
+/// Kitsu pages are capped at 20 episodes; 15 pages covers 300-episode shows.
+const KITSU_MAX_PAGES: usize = 15;
 
 static STREAMING_EPISODE_RE: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r"(?i)^\s*(?:episode|ep\.?)\s*(\d{1,4})\s*[-–—:]\s*(.+?)\s*$").unwrap()
@@ -237,12 +238,22 @@ impl MetadataProviders {
     {
         let mut last_status = 429u16;
         for attempt in 0..3 {
-            let response = match build()
-                .header("Accept", "application/json")
-                .header("Api-User-Agent", USER_AGENT)
-                .send()
-                .await
-            {
+            let mut request = build()
+                .build()
+                .map_err(|e| ProviderError::Http(describe_reqwest_error(&e)))?;
+            let headers = request.headers_mut();
+            // Kitsu wants its JSON:API media type; everyone else gets plain JSON.
+            if !headers.contains_key(reqwest::header::ACCEPT) {
+                headers.insert(
+                    reqwest::header::ACCEPT,
+                    reqwest::header::HeaderValue::from_static("application/json"),
+                );
+            }
+            headers.insert(
+                "Api-User-Agent",
+                reqwest::header::HeaderValue::from_static(USER_AGENT),
+            );
+            let response = match self.client.execute(request).await {
                 Ok(response) => response,
                 // Jikan regularly drops or stalls a connection under load
                 // (it proxies MyAnimeList live). A timeout or failed connect
@@ -424,11 +435,10 @@ impl MetadataProviders {
                 Ok(value)
             }
             Err(err) => {
-                // A timeout can be specific to one slow search, so it does not
-                // bench Jikan for everyone; a refused connection or a server
-                // error does.
+                // Jikan that times out keeps timing out (searches and episode
+                // lists alike), so any transport failure benches it.
                 let down = match &err {
-                    ProviderError::Http(message) => !message.contains("timed out"),
+                    ProviderError::Http(_) => true,
                     ProviderError::Status(code) => *code == 429 || *code >= 500,
                     ProviderError::Other(_) => false,
                 };
@@ -514,7 +524,7 @@ impl MetadataProviders {
         let id: i64 = show_id
             .parse()
             .map_err(|_| ProviderError::Other(format!("Invalid AniList id: {show_id}")))?;
-        let key = format!("anilist:episodes:{id}");
+        let key = format!("anilist:episodes:v2:{id}");
         let data = match self.db.get_cache(&key) {
             Some(cached) => cached,
             None => {
@@ -536,23 +546,123 @@ impl MetadataProviders {
             }
         };
         let media = &data["data"]["Media"];
-        let mut jikan_error = None;
+        // Try each source in turn; remember what each said for the error.
+        let mut outcomes = Vec::new();
         if let Some(mal_id) = media["idMal"].as_i64() {
-            match self.jikan_episodes(&mal_id.to_string()).await {
-                Ok(episodes) if !episodes.is_empty() => return Ok(episodes),
-                Ok(_) => {}
-                Err(err) => jikan_error = Some(err),
+            let mal_id = mal_id.to_string();
+            let jikan = self.jikan_episodes(&mal_id).await;
+            if matches!(&jikan, Ok(e) if !e.is_empty()) {
+                return jikan;
             }
-        }
-        let episodes = anilist_streaming_episodes(show_id, media);
-        if episodes.is_empty() {
-            if let Some(err) = jikan_error {
-                return Err(ProviderError::Other(format!(
-                    "No episode titles: MyAnimeList (Jikan) failed ({err}) and AniList lists none."
-                )));
+            outcomes.push(outcome("MyAnimeList (Jikan)", &jikan));
+            let kitsu = self.kitsu_episodes_by_mal(&mal_id).await;
+            if matches!(&kitsu, Ok(e) if !e.is_empty()) {
+                return kitsu;
             }
+            outcomes.push(outcome("Kitsu", &kitsu));
         }
+        let streaming = anilist_streaming_episodes(show_id, media);
+        if !streaming.is_empty() {
+            return Ok(streaming);
+        }
+        outcomes.push("AniList: none".to_string());
+        let titles = [
+            media["title"]["english"].as_str(),
+            media["title"]["romaji"].as_str(),
+        ];
+        for title in titles.into_iter().flatten() {
+            let tvmaze = self.tvmaze_episodes_by_title(title).await;
+            if matches!(&tvmaze, Ok(e) if !e.is_empty()) {
+                return tvmaze;
+            }
+            outcomes.push(outcome("TVMaze", &tvmaze));
+        }
+        Err(ProviderError::Other(format!(
+            "No episode titles found ({}).",
+            outcomes.join("; ")
+        )))
+    }
+
+    // ---- Kitsu (anime episode titles, no API key) ----
+
+    /// Episode titles from Kitsu for a MyAnimeList id, through Kitsu's own
+    /// MAL mapping. Episodes without a real title are left out.
+    async fn kitsu_episodes_by_mal(
+        &self,
+        mal_id: &str,
+    ) -> Result<Vec<EpisodeCandidate>, ProviderError> {
+        let mapping = self
+            .kitsu_get(
+                &format!("kitsu:mapping:mal:{mal_id}"),
+                &format!(
+                    "https://kitsu.app/api/edge/mappings?filter[externalSite]=myanimelist/anime&filter[externalId]={}&include=item",
+                    urlencoding::encode(mal_id)
+                ),
+            )
+            .await?;
+        let Some(kitsu_id) = mapping["included"]
+            .as_array()
+            .and_then(|items| items.iter().find(|i| i["type"] == "anime"))
+            .and_then(|item| item["id"].as_str())
+            .map(str::to_string)
+        else {
+            return Ok(Vec::new());
+        };
+        let mut episodes = Vec::new();
+        let mut url = Some(format!(
+            "https://kitsu.app/api/edge/anime/{}/episodes?page[limit]=20&sort=number",
+            urlencoding::encode(&kitsu_id)
+        ));
+        let mut page = 0;
+        while let Some(current) = url.take() {
+            if page >= KITSU_MAX_PAGES {
+                break;
+            }
+            let data = self
+                .kitsu_get(&format!("kitsu:episodes:{kitsu_id}:{page}"), &current)
+                .await?;
+            episodes.extend(kitsu_episode_candidates(&kitsu_id, &data));
+            url = data["links"]["next"].as_str().map(str::to_string);
+            page += 1;
+        }
+        episodes.sort_by_key(|e| e.episode);
+        episodes.dedup_by_key(|e| e.episode);
         Ok(episodes)
+    }
+
+    async fn kitsu_get(&self, key: &str, url: &str) -> Result<Value, ProviderError> {
+        if let Some(cached) = self.db.get_cache(key) {
+            return Ok(cached);
+        }
+        let value = self
+            .send_json(
+                || {
+                    self.client
+                        .get(url)
+                        .header(reqwest::header::ACCEPT, "application/vnd.api+json")
+                },
+                true,
+            )
+            .await?;
+        self.db.set_cache(key, &value);
+        Ok(value)
+    }
+
+    /// TVMaze episodes for the show whose name best matches `title`, when it
+    /// clearly is the same show.
+    async fn tvmaze_episodes_by_title(
+        &self,
+        title: &str,
+    ) -> Result<Vec<EpisodeCandidate>, ProviderError> {
+        let shows = self.search_tvmaze(title).await?;
+        let best = shows
+            .iter()
+            .map(|show| (title_similarity(title, &show.title), show))
+            .max_by(|a, b| a.0.total_cmp(&b.0));
+        match best {
+            Some((score, show)) if score >= 0.75 => self.tvmaze_episodes(&show.provider_id).await,
+            _ => Ok(Vec::new()),
+        }
     }
 
     async fn search_anilist(&self, query: &str) -> Result<Vec<ShowCandidate>, ProviderError> {
@@ -863,6 +973,44 @@ fn anilist_candidates(data: &Value) -> Vec<ShowCandidate> {
         .collect()
 }
 
+fn outcome(label: &str, result: &Result<Vec<EpisodeCandidate>, ProviderError>) -> String {
+    match result {
+        Ok(_) => format!("{label}: none"),
+        Err(err) => format!("{label}: {err}"),
+    }
+}
+
+/// Map a page of Kitsu episodes, skipping placeholder titles.
+fn kitsu_episode_candidates(kitsu_id: &str, data: &Value) -> Vec<EpisodeCandidate> {
+    let Some(items) = data["data"].as_array() else {
+        return Vec::new();
+    };
+    items
+        .iter()
+        .filter_map(|item| {
+            let attrs = &item["attributes"];
+            let number = attrs["number"].as_i64()?;
+            let title = [
+                attrs["canonicalTitle"].as_str(),
+                attrs["titles"]["en_us"].as_str(),
+                attrs["titles"]["en"].as_str(),
+                attrs["titles"]["en_jp"].as_str(),
+            ]
+            .into_iter()
+            .flatten()
+            .map(str::trim)
+            .find(|t| !t.is_empty() && !t.eq_ignore_ascii_case(&format!("Episode {number}")))?;
+            Some(EpisodeCandidate {
+                provider: "anilist".to_string(),
+                provider_show_id: kitsu_id.to_string(),
+                season: 1,
+                episode: number,
+                title: title.to_string(),
+            })
+        })
+        .collect()
+}
+
 /// Parse AniList `streamingEpisodes` titles such as "Episode 3 - The Witch".
 fn anilist_streaming_episodes(show_id: &str, media: &Value) -> Vec<EpisodeCandidate> {
     let Some(items) = media["streamingEpisodes"].as_array() else {
@@ -1082,5 +1230,26 @@ mod tests {
         );
         assert_eq!(episodes[1].provider, "anilist");
         assert!(anilist_streaming_episodes("42", &serde_json::json!({})).is_empty());
+    }
+
+    #[test]
+    fn maps_kitsu_episodes_and_skips_placeholders() {
+        let data = serde_json::json!({"data": [
+            {"attributes": {"number": 2, "canonicalTitle": "The Witch", "titles": {}}},
+            {"attributes": {"number": 1, "canonicalTitle": "", "titles": {"en_us": "Pilot"}}},
+            {"attributes": {"number": 3, "canonicalTitle": "Episode 3", "titles": {}}},
+            {"attributes": {"number": null, "canonicalTitle": "Recap"}},
+        ]});
+        let episodes = kitsu_episode_candidates("9", &data);
+        assert_eq!(episodes.len(), 2);
+        assert_eq!(
+            (episodes[0].episode, episodes[0].title.as_str()),
+            (2, "The Witch")
+        );
+        assert_eq!(
+            (episodes[1].episode, episodes[1].title.as_str()),
+            (1, "Pilot")
+        );
+        assert_eq!(episodes[0].provider, "anilist");
     }
 }
