@@ -132,8 +132,9 @@ the app.
 
 ## Web UI Pages
 
-- **Duplicates:** scan status and controls, Unused torrents (phase 1); duplicate groups and
-  operation history follow in phases 2–3.
+- **Duplicates:** scan status and controls (walk and hashing progress, speed, time left),
+  duplicate groups sorted by recoverable space with a per-folder-pair summary and filters by
+  pair, folder and size, Unused torrents; operation history follows in phase 3.
 
 - **Settings:** input/output roots, copy speed limit, folder picker, permission checks.
 - **Browse:** input-root navigation, human-readable sizes (e.g. `1,34 Go`), multi-select,
@@ -175,7 +176,7 @@ Goals:
 Delivery is phased; each phase is reviewed before the next:
 
 - **Phase 1 (done):** settings, `dedupe.db`, metadata scan, Unused torrents. Read-only.
-- **Phase 2:** partial then full (BLAKE3) hashing, duplicate groups, read-only Duplicates list.
+- **Phase 2 (done):** partial then full (BLAKE3) hashing, duplicate groups, read-only Duplicates list.
 - **Phase 3:** simulation, hardlink replacement with re-verification, journal, crash recovery.
 
 ### Settings (Settings › Duplicates)
@@ -203,12 +204,31 @@ window (`01:00-07:00`), preferred owner of the kept inode (default `100000:10000
 - Automatic scans start or resume inside the configured window (at most one new full scan per
   20 h) and stop, resumably, when it closes. Manual scans ignore the window.
 
+### Duplicate detection (phase 2)
+
+- Runs as the second stage of the same scan job (walk → quick hash → full hash → groups), with
+  the same pause/resume/stop; a run is `completed` only after grouping. Stopping during hashing
+  resumes straight into hashing, without walking again.
+- Candidates: inodes sharing `(dev, size)` with another inode; paths already hardlinked together
+  are one inode, so one candidate.
+- Quick hash: BLAKE3 over the size plus 1 MiB at the head, middle and tail (files ≤ 3 MiB are
+  read whole). Full hash (BLAKE3, 4 MiB sequential reads) only for inodes whose quick hash still
+  collides. One file at a time, throttled to the configured Mo/s, `fstat` before and after each
+  file to discard anything that changed since the walk.
+- Hashes are stored per `(dev, ino)` with the size and mtime they were taken at and reused while
+  those match, so an unchanged file is never read again. Unreadable files are recorded and not
+  retried until they change.
+- Groups: same dev, size and full hash, 2+ inodes; recoverable space = size × (inodes − 1);
+  labelled by folder pair (`Films ↔ Movies`). The kept inode is shown: most hard links, then the
+  preferred owner, then the oldest mtime. Groups whose owners differ carry a warning.
+
 ### API
 
 `GET/PUT /api/dedupe/settings`, `POST /api/dedupe/scan` (`{ "fresh": bool }`),
 `POST /api/dedupe/scan/pause|resume|cancel|clear`, `GET /api/dedupe/scan/status`,
-`GET /api/dedupe/unused-torrents?limit&offset`. Planned: `GET /api/dedupe/groups`,
-`POST /api/dedupe/jobs`, `GET /api/dedupe/jobs/:id`, `GET /api/dedupe/history`.
+`GET /api/dedupe/unused-torrents?limit&offset`,
+`GET /api/dedupe/groups?limit&offset&pair&folder&min_size` (folder must be inside the dedupe
+roots). Planned: `POST /api/dedupe/jobs`, `GET /api/dedupe/jobs/:id`, `GET /api/dedupe/history`.
 
 ### Safety (all phases)
 

@@ -6,6 +6,7 @@ use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+use crate::dedupe::groups::{self, GroupsFilter, GroupsPage};
 use crate::dedupe::settings::{DedupeSettings, DedupeSettingsPayload};
 use crate::dedupe::store::{self, UnusedTorrents};
 use crate::dedupe::{check_roots, RootsReport, ScanStatus};
@@ -22,6 +23,7 @@ pub fn router() -> Router<AppState> {
         .route("/api/dedupe/scan/cancel", post(cancel_scan))
         .route("/api/dedupe/scan/clear", post(clear_scan))
         .route("/api/dedupe/unused-torrents", get(unused_torrents))
+        .route("/api/dedupe/groups", get(list_groups))
 }
 
 /// Run blocking work (filesystem checks, `dedupe.db` reads) off the async
@@ -164,4 +166,52 @@ async fn unused_torrents(
     .await?
     .map_err(|e| AppError::new(axum::http::StatusCode::INTERNAL_SERVER_ERROR, e))?;
     Ok(Json(view))
+}
+
+#[derive(Deserialize)]
+struct GroupsQuery {
+    limit: Option<i64>,
+    offset: Option<i64>,
+    /// Exact pair label from the summary ("Films ↔ Movies").
+    pair: Option<String>,
+    /// Only groups with a path under this folder (inside a dedupe root).
+    folder: Option<String>,
+    /// Minimum file size in bytes.
+    min_size: Option<i64>,
+}
+
+async fn list_groups(
+    State(state): State<AppState>,
+    Query(query): Query<GroupsQuery>,
+) -> AppResult<Json<GroupsPage>> {
+    let service = state.dedupe.clone();
+    let page = blocking(move || -> Result<GroupsPage, AppError> {
+        let settings = service.settings();
+        let folder = query
+            .folder
+            .filter(|f| !f.trim().is_empty())
+            .map(|f| crate::dedupe::settings::normalize_root(&f));
+        // Same guard as browsing: a folder filter must stay inside the roots.
+        if let Some(folder) = &folder {
+            if !settings.roots.iter().any(|root| folder.starts_with(root)) {
+                return Err(AppError::bad_request("Folder is outside the dedupe roots"));
+            }
+        }
+        let filter = GroupsFilter {
+            pair: query.pair.filter(|p| !p.is_empty()),
+            min_size: query.min_size.unwrap_or(0).max(0),
+            folder: folder.map(|f| f.display().to_string()),
+            limit: query.limit.unwrap_or(50).clamp(1, 500),
+            offset: query.offset.unwrap_or(0).max(0),
+        };
+        let conn = service.store().lock();
+        groups::list_groups(&conn, &filter, settings.preferred_owner).map_err(|e| {
+            AppError::new(
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                format!("dedupe.db error: {e}"),
+            )
+        })
+    })
+    .await??;
+    Ok(Json(page))
 }

@@ -4,6 +4,8 @@ import { api, ApiError } from "../api";
 import { useProgress } from "../components/Progress";
 import { formatBytes } from "../theme";
 import type {
+  DedupeGroup,
+  DedupeGroupsPage,
   DedupeRootsReport,
   DedupeScanRun,
   DedupeScanStatus,
@@ -37,14 +39,14 @@ function errorText(e: unknown): string {
   return e instanceof ApiError ? e.message : String(e);
 }
 
-type Tab = "unused";
+type Tab = "groups" | "unused";
 
 export default function DedupePage() {
   const [status, setStatus] = useState<DedupeScanStatus | null>(null);
   const [report, setReport] = useState<DedupeRootsReport | null>(null);
   const [hasRoots, setHasRoots] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  const [tab, setTab] = useState<Tab>("unused");
+  const [tab, setTab] = useState<Tab>("groups");
 
   const refresh = useCallback(() => {
     api
@@ -106,12 +108,21 @@ export default function DedupePage() {
           <button
             type="button"
             role="tab"
+            className={`segmented-button ${tab === "groups" ? "active" : ""}`}
+            onClick={() => setTab("groups")}
+          >
+            Duplicates
+          </button>
+          <button
+            type="button"
+            role="tab"
             className={`segmented-button ${tab === "unused" ? "active" : ""}`}
             onClick={() => setTab("unused")}
           >
             Unused torrents
           </button>
         </div>
+        {tab === "groups" && <GroupsList scanGeneration={status?.last_completed?.id ?? 0} />}
         {tab === "unused" && <UnusedTorrents scanGeneration={status?.last_completed?.id ?? 0} />}
       </section>
     </>
@@ -138,10 +149,20 @@ function ScanPanel({ status, onChange }: { status: DedupeScanStatus; onChange: (
     }
   }
 
-  const percent =
-    live && status.eta_basis === "previous_scan" && lastFull && lastFull.dirs_done > 0
-      ? Math.min(99, Math.floor((live.counters.dirs_done / lastFull.dirs_done) * 100))
-      : null;
+  const hashing = live != null && (live.stage === "partial" || live.stage === "full");
+  const percent = !live
+    ? null
+    : hashing
+      ? live.hash_bytes_total > 0
+        ? Math.min(99, Math.floor((live.hash_bytes_done / live.hash_bytes_total) * 100))
+        : null
+      : live.stage === "walk" && status.eta_basis === "previous_scan" && lastFull && lastFull.dirs_done > 0
+        ? Math.min(99, Math.floor((live.counters.dirs_done / lastFull.dirs_done) * 100))
+        : null;
+  const etaText =
+    status.eta_secs == null
+      ? "-"
+      : `${status.eta_basis === "queue" ? "≥ " : "≈ "}${formatDuration(status.eta_secs)}`;
 
   return (
     <div className="dedupe-scan">
@@ -205,6 +226,23 @@ function ScanPanel({ status, onChange }: { status: DedupeScanStatus; onChange: (
               style={percent == null ? undefined : { width: `${percent}%` }}
             />
           </div>
+          <p className="dedupe-stage">{STAGE_LABELS[live.stage] ?? live.stage}</p>
+          {hashing ? (
+            <dl className="dedupe-stats">
+              <Stat
+                label="Files hashed"
+                value={`${formatCount(live.hash_files_done)} / ${formatCount(live.hash_files_total)}`}
+              />
+              <Stat
+                label="Read"
+                value={`${formatBytes(live.hash_bytes_done)} / ${formatBytes(live.hash_bytes_total)}`}
+              />
+              <Stat label="Speed" value={`${formatBytes(live.bytes_per_sec)}/s`} />
+              <Stat label="Time left (this pass)" value={etaText} />
+              <Stat label="Read errors" value={formatCount(live.hash_errors)} />
+              <Stat label="Elapsed (walk)" value={formatDuration(live.elapsed_secs)} />
+            </dl>
+          ) : (
           <dl className="dedupe-stats">
             <Stat label="Folders walked" value={formatCount(live.counters.dirs_done)} />
             <Stat label="Folders queued" value={formatCount(live.pending_dirs)} />
@@ -221,15 +259,14 @@ function ScanPanel({ status, onChange }: { status: DedupeScanStatus; onChange: (
             <Stat
               label="Time left"
               value={
-                status.eta_secs == null
-                  ? "-"
-                  : `${status.eta_basis === "queue" ? "≥ " : "≈ "}${formatDuration(status.eta_secs)}`
+                etaText
               }
             />
             <Stat label="I/O class" value={live.io_priority_idle ? "idle" : "normal (throttled)"} />
           </dl>
+          )}
           <p className="muted dedupe-current">{live.current_dir}</p>
-          {status.eta_basis === "queue" && (
+          {live.stage === "walk" && status.eta_basis === "queue" && (
             <p className="muted">
               First scan: the estimate only counts folders discovered so far and grows as the walk
               goes deeper.
@@ -242,9 +279,10 @@ function ScanPanel({ status, onChange }: { status: DedupeScanStatus; onChange: (
 
       {!live && unfinished && (
         <p className="warning-note">
-          An unfinished scan (started {formatDbTime(unfinished.started_at)}) stopped after{" "}
-          {formatCount(unfinished.dirs_done)} folders with {formatCount(unfinished.pending_dirs)} still
-          queued. Resume continues where it stopped.
+          An unfinished scan (started {formatDbTime(unfinished.started_at)}) stopped{" "}
+          {unfinished.stage === "hash"
+            ? "while hashing; the walk is done, Resume goes straight back to hashing."
+            : `after ${formatCount(unfinished.dirs_done)} folders with ${formatCount(unfinished.pending_dirs)} still queued. Resume continues where it stopped.`}
         </p>
       )}
       {status.last_outcome === "failed" && status.last_error && (
@@ -253,7 +291,18 @@ function ScanPanel({ status, onChange }: { status: DedupeScanStatus; onChange: (
 
       <dl className="dedupe-stats">
         <Stat label="Last full scan" value={lastFull ? formatDbTime(lastFull.finished_at) : "never"} />
-        {lastFull && <Stat label="Took" value={formatDuration(lastFull.elapsed_secs)} />}
+        {lastFull && (
+          <Stat
+            label="Took"
+            value={`${formatDuration(lastFull.elapsed_secs)} walk · ${formatDuration(lastFull.hash_secs)} hash`}
+          />
+        )}
+        {lastFull && (
+          <Stat
+            label="Hashed last time"
+            value={`${formatCount(lastFull.hash_files)} files · ${formatBytes(lastFull.hash_bytes)} read`}
+          />
+        )}
         <Stat
           label="Known files"
           value={`${formatCount(status.inventory.files)} paths · ${formatCount(status.inventory.inodes)} inodes · ${formatBytes(status.inventory.bytes)}`}
@@ -263,6 +312,13 @@ function ScanPanel({ status, onChange }: { status: DedupeScanStatus; onChange: (
     </div>
   );
 }
+
+const STAGE_LABELS: Record<string, string> = {
+  walk: "Step 1/3 · walking folders (metadata only)",
+  partial: "Step 2/3 · quick hash (head, middle and tail of same-size files)",
+  full: "Step 3/3 · full hash (only files whose quick hash matched)",
+  groups: "Building duplicate groups...",
+};
 
 function Stat({ label, value }: { label: string; value: string }) {
   return (
@@ -280,6 +336,7 @@ function SkipSummary({ run }: { run: DedupeScanRun }) {
     run.skipped_excluded > 0 && `${formatCount(run.skipped_excluded)} excluded`,
     run.skipped_other_fs > 0 && `${formatCount(run.skipped_other_fs)} on another filesystem`,
     run.skipped_errors > 0 && `${formatCount(run.skipped_errors)} unreadable`,
+    run.hash_errors > 0 && `${formatCount(run.hash_errors)} could not be hashed`,
   ].filter(Boolean);
   if (parts.length === 0) return null;
   return <p className="muted">Ignored in the last full scan: {parts.join(" · ")}.</p>;
@@ -379,6 +436,240 @@ function UnusedTorrents({ scanGeneration }: { scanGeneration: number }) {
           </button>
         </div>
       )}
+    </div>
+  );
+}
+
+const GROUPS_PAGE = 50;
+
+const MIN_SIZES: { label: string; bytes: number }[] = [
+  { label: "any size", bytes: 0 },
+  { label: "≥ 100 Mo", bytes: 100 * 1024 ** 2 },
+  { label: "≥ 1 Go", bytes: 1024 ** 3 },
+  { label: "≥ 5 Go", bytes: 5 * 1024 ** 3 },
+  { label: "≥ 20 Go", bytes: 20 * 1024 ** 3 },
+];
+
+function GroupsList({ scanGeneration }: { scanGeneration: number }) {
+  const [data, setData] = useState<DedupeGroupsPage | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [pair, setPair] = useState("");
+  const [folderInput, setFolderInput] = useState("");
+  const [folder, setFolder] = useState("");
+  const [minSize, setMinSize] = useState(0);
+  const [offset, setOffset] = useState(0);
+
+  useEffect(() => {
+    api
+      .getDedupeGroups({ limit: GROUPS_PAGE, offset, pair, folder, minSize })
+      .then((next) => {
+        setData(next);
+        setError(null);
+      })
+      .catch((e) => setError(errorText(e)));
+  }, [offset, pair, folder, minSize, scanGeneration]);
+
+  function choosePair(label: string) {
+    setPair(label === pair ? "" : label);
+    setOffset(0);
+  }
+
+  if (!data && !error) return <p className="muted">Loading...</p>;
+  const summary = data?.summary;
+
+  return (
+    <div className="dedupe-groups">
+      {error && <p className="error">{error}</p>}
+      {summary && summary.groups === 0 ? (
+        <p className="muted">
+          No duplicates found yet. Groups appear once a scan has finished its hashing steps.
+        </p>
+      ) : (
+        summary && (
+          <>
+            <dl className="dedupe-stats">
+              <Stat label="Groups" value={formatCount(summary.groups)} />
+              <Stat label="Recoverable" value={formatBytes(summary.reclaimable)} />
+              <Stat label="Inodes involved" value={formatCount(summary.inodes)} />
+              <Stat label="Built" value={formatDbTime(summary.built_at)} />
+            </dl>
+            <table className="dedupe-pairs">
+              <thead>
+                <tr>
+                  <th>Folders</th>
+                  <th>Groups</th>
+                  <th>Recoverable</th>
+                </tr>
+              </thead>
+              <tbody>
+                {summary.by_pair.map((p) => (
+                  <tr
+                    key={p.label}
+                    className={`clickable-row ${pair === p.label ? "selected-row" : ""}`}
+                    onClick={() => choosePair(p.label)}
+                  >
+                    <td>{p.label}</td>
+                    <td className="nowrap-cell">{formatCount(p.groups)}</td>
+                    <td className="nowrap-cell">{formatBytes(p.reclaimable)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+            <p className="muted">
+              Read-only for now: nothing is linked yet. The kept file is chosen by {data?.keeper_rule}.
+              Space only comes back once ZFS snapshots holding the old copies expire.
+            </p>
+          </>
+        )
+      )}
+
+      {summary && summary.groups > 0 && data && (
+        <>
+          <div className="toolbar">
+            <label className="toolbar-field">
+              Folders
+              <select
+                value={pair}
+                onChange={(e) => {
+                  setPair(e.target.value);
+                  setOffset(0);
+                }}
+              >
+                <option value="">all</option>
+                {summary.by_pair.map((p) => (
+                  <option key={p.label} value={p.label}>
+                    {p.label}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label className="toolbar-field">
+              File size
+              <select
+                value={minSize}
+                onChange={(e) => {
+                  setMinSize(Number(e.target.value));
+                  setOffset(0);
+                }}
+              >
+                {MIN_SIZES.map((m) => (
+                  <option key={m.bytes} value={m.bytes}>
+                    {m.label}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <form
+              className="toolbar-field dedupe-folder-filter"
+              onSubmit={(e) => {
+                e.preventDefault();
+                setFolder(folderInput.trim());
+                setOffset(0);
+              }}
+            >
+              Under folder
+              <input
+                value={folderInput}
+                placeholder="/mnt/data/Films"
+                onChange={(e) => setFolderInput(e.target.value)}
+                onBlur={() => {
+                  setFolder(folderInput.trim());
+                  setOffset(0);
+                }}
+              />
+            </form>
+            <span className="muted">
+              {formatCount(data.total)} groups · {formatBytes(data.total_reclaimable)} recoverable
+            </span>
+          </div>
+
+          {data.groups.map((group) => (
+            <GroupCard key={group.id} group={group} />
+          ))}
+
+          {data.total > GROUPS_PAGE && (
+            <div className="toolbar dedupe-pager">
+              <button
+                className="secondary-button"
+                type="button"
+                disabled={offset === 0}
+                onClick={() => setOffset(Math.max(0, offset - GROUPS_PAGE))}
+              >
+                Previous
+              </button>
+              <span className="muted">
+                {offset + 1}–{Math.min(offset + GROUPS_PAGE, data.total)} of {formatCount(data.total)}
+              </span>
+              <button
+                className="secondary-button"
+                type="button"
+                disabled={offset + GROUPS_PAGE >= data.total}
+                onClick={() => setOffset(offset + GROUPS_PAGE)}
+              >
+                Next
+              </button>
+            </div>
+          )}
+        </>
+      )}
+    </div>
+  );
+}
+
+function GroupCard({ group }: { group: DedupeGroup }) {
+  return (
+    <div className="match-group dedupe-group">
+      <div className="group-header">
+        <div className="group-show">
+          <strong>{formatBytes(group.reclaimable)}</strong>
+          <span className="muted">
+            recoverable · {group.inode_count} copies of {formatBytes(group.size)} · {group.pair_label}
+          </span>
+          <span className="muted dedupe-hash" title={group.hash}>
+            blake3 {group.hash.slice(0, 12)}
+          </span>
+        </div>
+      </div>
+      {group.owners_differ && (
+        <p className="warning-note">
+          Owners differ. After linking, every path shares the kept file&apos;s owner, permissions and
+          modification time.
+        </p>
+      )}
+      <table>
+        <thead>
+          <tr>
+            <th></th>
+            <th>Path(s)</th>
+            <th>Inode</th>
+            <th>Links</th>
+            <th>Owner</th>
+            <th>Modified</th>
+          </tr>
+        </thead>
+        <tbody>
+          {group.members.map((member) => (
+            <tr key={member.ino} className={member.keep ? "dedupe-keep" : ""}>
+              <td className="nowrap-cell">
+                <span className={`state-badge ${member.keep ? "state-imported" : "state-skipped"}`}>
+                  {member.keep ? "keep" : "duplicate"}
+                </span>
+              </td>
+              <td className="path-cell">
+                {member.paths.map((path) => (
+                  <div key={path}>{path}</div>
+                ))}
+              </td>
+              <td className="nowrap-cell">{member.ino}</td>
+              <td className="nowrap-cell">{member.nlink}</td>
+              <td className="nowrap-cell">
+                {member.uid}:{member.gid}
+              </td>
+              <td className="nowrap-cell">{new Date(member.mtime * 1000).toLocaleDateString()}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
     </div>
   );
 }

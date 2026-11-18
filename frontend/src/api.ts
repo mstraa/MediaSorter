@@ -1,5 +1,6 @@
 import type {
   BrowseResponse,
+  DedupeGroupsPage,
   DedupeScanStatus,
   DedupeSettings,
   DedupeSettingsView,
@@ -58,6 +59,19 @@ export const api = {
     }),
   dedupeScanAction: (action: "pause" | "resume" | "cancel" | "clear") =>
     request<{ status: string }>(`/api/dedupe/scan/${action}`, { method: "POST" }),
+  getDedupeGroups: (params: {
+    limit: number;
+    offset: number;
+    pair?: string;
+    folder?: string;
+    minSize?: number;
+  }) => {
+    const query = new URLSearchParams({ limit: String(params.limit), offset: String(params.offset) });
+    if (params.pair) query.set("pair", params.pair);
+    if (params.folder) query.set("folder", params.folder);
+    if (params.minSize) query.set("min_size", String(params.minSize));
+    return request<DedupeGroupsPage>(`/api/dedupe/groups?${query.toString()}`);
+  },
   getUnusedTorrents: (limit: number, offset: number) =>
     request<UnusedTorrentsResponse>(
       `/api/dedupe/unused-torrents?limit=${limit}&offset=${offset}`,
