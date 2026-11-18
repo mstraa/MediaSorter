@@ -109,6 +109,11 @@ cd frontend && npm run build   # type-check + bundle the frontend
 - Toggle light/dark theme in the browser.
 - Expose `GET /health` for service health checks.
 - Provide Proxmox LXC creation, update, and media-mount access helper scripts.
+- **Duplicates (in progress):** find files with identical content on different
+  inodes of the same filesystem, to later replace them with hardlinks. Phase 1
+  ships a throttled, resumable, read-only metadata scan of configurable dedupe
+  roots and an **Unused torrents** list (files under the torrent folders that
+  nothing else links to, `nlink = 1`). See `docs/PRD.md` › Duplicates.
 
 ## Import Workflow
 

@@ -9,6 +9,7 @@
 pub mod assets;
 pub mod config;
 pub mod db;
+pub mod dedupe;
 pub mod error;
 pub mod ffprobe;
 pub mod filesystem;
@@ -32,6 +33,7 @@ use tower_http::trace::TraceLayer;
 
 use crate::config::AppConfig;
 use crate::db::Database;
+use crate::dedupe::DedupeService;
 use crate::jobs::JobManager;
 use crate::providers::MetadataProviders;
 use crate::state::AppState;
@@ -83,11 +85,21 @@ fn cors_layer() -> CorsLayer {
 pub fn build_app(config: AppConfig) -> Router {
     let db = Database::open(&config.database_path).expect("failed to open database");
     let providers = MetadataProviders::new(db.clone());
+    // `dedupe.db` sits next to the main database (see `dedupe::store` for why
+    // it is a separate file).
+    let dedupe_path = config
+        .database_path
+        .parent()
+        .map(|dir| dir.join("dedupe.db"))
+        .unwrap_or_else(|| config.data_dir.join("dedupe.db"));
+    let dedupe = DedupeService::open(db.clone(), &dedupe_path).expect("failed to open dedupe.db");
+    dedupe.startup();
     let state = AppState {
         config,
         db,
         providers,
         jobs: JobManager::new(),
+        dedupe,
     };
 
     routes::build_router(state)

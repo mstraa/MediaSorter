@@ -1,5 +1,8 @@
 import type {
   BrowseResponse,
+  DedupeScanStatus,
+  DedupeSettings,
+  DedupeSettingsView,
   EpisodeCandidate,
   FoldersResponse,
   ImportBatch,
@@ -11,6 +14,7 @@ import type {
   PreviewResult,
   Settings,
   ShowCandidate,
+  UnusedTorrentsResponse,
 } from "./types";
 
 export class ApiError extends Error {}
@@ -39,6 +43,26 @@ async function request<T>(url: string, options?: RequestInit): Promise<T> {
 }
 
 export const api = {
+  // ---- Duplicates ----
+  getDedupeSettings: () => request<DedupeSettingsView>("/api/dedupe/settings"),
+  saveDedupeSettings: (settings: DedupeSettings) =>
+    request<DedupeSettingsView>("/api/dedupe/settings", {
+      method: "PUT",
+      body: JSON.stringify(settings),
+    }),
+  getDedupeScanStatus: () => request<DedupeScanStatus>("/api/dedupe/scan/status"),
+  startDedupeScan: (fresh = false) =>
+    request<DedupeScanStatus>("/api/dedupe/scan", {
+      method: "POST",
+      body: JSON.stringify({ fresh }),
+    }),
+  dedupeScanAction: (action: "pause" | "resume" | "cancel" | "clear") =>
+    request<{ status: string }>(`/api/dedupe/scan/${action}`, { method: "POST" }),
+  getUnusedTorrents: (limit: number, offset: number) =>
+    request<UnusedTorrentsResponse>(
+      `/api/dedupe/unused-torrents?limit=${limit}&offset=${offset}`,
+    ),
+
   getSettings: () => request<Settings>("/api/settings"),
   saveSettings: (payload: {
     input_roots: string[];

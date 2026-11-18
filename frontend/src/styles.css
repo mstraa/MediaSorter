@@ -1407,3 +1407,55 @@ details summary {
     grid-template-columns: 1fr 1fr;
   }
 }
+
+/* ---- Duplicates ---- */
+
+.warning-note {
+  color: var(--amber);
+  border: 1px solid rgba(240, 178, 77, 0.45);
+  background: rgba(240, 178, 77, 0.08);
+  padding: 0.55rem 0.75rem;
+  font-family: var(--mono);
+  font-size: 12px;
+}
+
+.dedupe-live {
+  margin: 0.4rem 0 1rem;
+}
+
+.dedupe-stats {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(190px, 1fr));
+  gap: 0.6rem 1rem;
+  margin: 0.85rem 0;
+}
+
+.dedupe-stats dt {
+  font-family: var(--mono);
+  font-size: 11px;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.dedupe-stats dd {
+  margin: 0.15rem 0 0;
+  font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
+}
+
+.dedupe-current {
+  overflow-wrap: anywhere;
+}
+
+.dedupe-unused {
+  margin-top: 0.85rem;
+}
+
+.dedupe-pager {
+  margin-top: 0.85rem;
+  align-items: center;
+}
+
+.dedupe-root-table td {
+  overflow-wrap: anywhere;
+}

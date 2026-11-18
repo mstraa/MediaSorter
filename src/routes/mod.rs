@@ -8,6 +8,8 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde_json::{json, Value};
 
+mod dedupe;
+
 use crate::assets::static_handler;
 use crate::db::ImportRow;
 use crate::error::{AppError, AppResult};
@@ -56,6 +58,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/episodes", get(episodes))
         .route("/api/source-status", post(source_status))
         .route("/api/folders", get(folders))
+        .merge(dedupe::router())
         // axum caps JSON bodies at 2 MB by default. An import or preview batch
         // carries one ~250-byte entry per file, so selecting more than about
         // 8,000 files was rejected outright with a 413.

@@ -8,12 +8,14 @@ import ImportsPage from "./pages/Imports";
 import ResultsPage from "./pages/Results";
 import HistoryPage from "./pages/History";
 import SettingsPage from "./pages/Settings";
+import DedupePage from "./pages/Dedupe";
 import { toggleTheme, type Theme } from "./theme";
 
 const NAV = [
   { to: "/browse", label: "Browse", hint: "input" },
   { to: "/imports", label: "Imports", hint: "jobs" },
   { to: "/history", label: "History", hint: "log" },
+  { to: "/duplicates", label: "Duplicates", hint: "dedupe" },
   { to: "/settings", label: "Settings", hint: "config" },
 ];
 
@@ -89,6 +91,7 @@ export default function App() {
             <Route path="/imports" element={<ImportsPage />} />
             <Route path="/results/:jobId" element={<ResultsPage />} />
             <Route path="/history" element={<HistoryPage />} />
+            <Route path="/duplicates" element={<DedupePage />} />
             <Route path="/settings" element={<SettingsPage />} />
             <Route path="*" element={<Navigate to="/browse" replace />} />
           </Routes>
