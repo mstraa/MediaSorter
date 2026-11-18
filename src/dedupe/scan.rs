@@ -25,6 +25,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
 
+use super::groups::rebuild_groups;
+use super::hash::{run_hash, HashCounters, HashOutcome};
 use super::settings::{DedupeSettings, ExcludeMatcher};
 use super::store::{self, open_connection};
 use super::throttle::{set_idle_io_priority, RateLimiter, RunControl};
@@ -93,6 +95,16 @@ pub struct LiveProgress {
     pub paused: bool,
     pub io_priority_idle: bool,
     pub last_error: Option<String>,
+    /// "walk", then "partial" / "full" (hashing), then "groups".
+    pub stage: String,
+    pub hash_files_total: i64,
+    pub hash_files_done: i64,
+    pub hash_bytes_total: i64,
+    pub hash_bytes_done: i64,
+    pub hash_errors: i64,
+    /// `hash_bytes_done` when the current hashing session started (rates).
+    pub hash_session_base: i64,
+    pub hash_session_started: Option<Instant>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -411,7 +423,7 @@ fn prepare_run(
 ) -> rusqlite::Result<(store::ScanRunRow, bool)> {
     if let Some(run) = store::latest_unfinished_run(conn)? {
         let same_roots = serde_json::to_string(&run.roots).unwrap_or_default() == roots_json;
-        if !fresh && same_roots && run.pending_dirs > 0 {
+        if !fresh && same_roots && (run.pending_dirs > 0 || run.stage == "hash") {
             conn.execute(
                 "UPDATE scan_runs SET state = 'running', updated_at = CURRENT_TIMESTAMP
                  WHERE id = ?1",
@@ -508,6 +520,7 @@ pub fn run_scan(
             elapsed_before,
             io_priority_idle: io_idle,
             last_error: run.last_error.clone(),
+            stage: "walk".into(),
             ..Default::default()
         }
     });
@@ -632,10 +645,7 @@ pub fn run_scan(
         }
     };
 
-    let state = match outcome {
-        ScanOutcome::Completed { .. } => "completed",
-        ScanOutcome::Stopped { .. } => "interrupted",
-    };
+    let walk_done = matches!(outcome, ScanOutcome::Completed { .. });
     save_counters(
         &conn,
         run.id,
@@ -644,14 +654,81 @@ pub fn run_scan(
         &walker.last_error,
     )
     .map_err(db_err)?;
+    // A finished walk moves the run to its hash stage; it only becomes
+    // `completed` once hashing and grouping are done too.
     conn.execute(
-        "UPDATE scan_runs SET state = ?2,
-            finished_at = CASE WHEN ?2 = 'completed' THEN CURRENT_TIMESTAMP ELSE NULL END
+        "UPDATE scan_runs SET state = ?2, stage = CASE WHEN ?3 THEN 'hash' ELSE stage END
          WHERE id = ?1",
-        params![run.id, state],
+        params![
+            run.id,
+            if walk_done { "running" } else { "interrupted" },
+            walk_done
+        ],
     )
     .map_err(db_err)?;
     conn.execute_batch("COMMIT").map_err(db_err)?;
+    if !walk_done {
+        return Ok(outcome);
+    }
+
+    // ---- Phase 2: hashing, then groups ----
+    let mut hash_counters = HashCounters::default();
+    let mut last_error = walker.last_error.clone();
+    let hash_started = Instant::now();
+    let hashed = run_hash(
+        &conn,
+        settings.read_rate_mbps,
+        control,
+        live,
+        &mut hash_counters,
+        &mut last_error,
+    );
+    conn.execute(
+        "UPDATE scan_runs SET hash_files = hash_files + ?2, hash_bytes = hash_bytes + ?3,
+            hash_errors = hash_errors + ?4, hash_secs = hash_secs + ?5, last_error = ?6,
+            updated_at = CURRENT_TIMESTAMP
+         WHERE id = ?1",
+        params![
+            run.id,
+            hash_counters.files,
+            hash_counters.bytes,
+            hash_counters.errors,
+            hash_started.elapsed().as_secs_f64(),
+            last_error,
+        ],
+    )
+    .map_err(db_err)?;
+    match hashed {
+        Ok(HashOutcome::Completed) => {}
+        Ok(HashOutcome::Stopped) => {
+            conn.execute(
+                "UPDATE scan_runs SET state = 'interrupted' WHERE id = ?1",
+                params![run.id],
+            )
+            .map_err(db_err)?;
+            return Ok(ScanOutcome::Stopped { run_id: run.id });
+        }
+        Err(e) => {
+            let _ = conn.execute(
+                "UPDATE scan_runs SET state = 'interrupted', last_error = ?2 WHERE id = ?1",
+                params![run.id, e],
+            );
+            return Err(e);
+        }
+    }
+
+    set_live(live, |l| {
+        l.stage = "groups".into();
+        l.current_dir.clear();
+    });
+    let roots = effective_roots(&settings.roots);
+    rebuild_groups(&conn, &roots).map_err(db_err)?;
+    conn.execute(
+        "UPDATE scan_runs SET state = 'completed', finished_at = CURRENT_TIMESTAMP
+         WHERE id = ?1",
+        params![run.id],
+    )
+    .map_err(db_err)?;
     Ok(outcome)
 }
 
@@ -901,6 +978,186 @@ mod tests {
         let outcome = handle.join().unwrap().unwrap();
         assert!(matches!(outcome, ScanOutcome::Completed { .. }));
         assert_eq!(recorded(&db).len(), 31);
+    }
+
+    fn groups(db: &Path) -> Vec<(i64, i64, i64)> {
+        let conn = open_connection(db).unwrap();
+        let mut stmt = conn
+            .prepare("SELECT size, inode_count, reclaimable FROM dup_groups ORDER BY size")
+            .unwrap();
+        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect()
+    }
+
+    fn last_run(db: &Path) -> store::ScanRunRow {
+        let conn = open_connection(db).unwrap();
+        store::latest_completed_run(&conn).unwrap().unwrap()
+    }
+
+    const MIB: usize = 1024 * 1024;
+
+    #[test]
+    fn identical_files_form_a_group_and_near_copies_do_not() {
+        let tmp = TempDir::new();
+        let root = tmp.0.join("data");
+        // Large identical pair (partial + full pass).
+        let big: Vec<u8> = (0..8 * MIB).map(|i| (i % 251) as u8).collect();
+        write(&root.join("Films/a.mkv"), &big);
+        write(&root.join("Movies/a.mkv"), &big);
+        // Same size, differs only in the last byte: partial hashes differ.
+        let mut last = big.clone();
+        *last.last_mut().unwrap() ^= 1;
+        write(&root.join("Movies/last-byte.mkv"), &last);
+        // Same size, differs at 1.5 MiB (outside the partial windows):
+        // partial collides, the full hash tells them apart.
+        let mut middle = big.clone();
+        middle[MIB + MIB / 2] ^= 1;
+        write(&root.join("Tv/middle.mkv"), &middle);
+        // Small identical pair (hashed whole in the partial pass).
+        write(&root.join("Tv/s.mkv"), b"small identical content");
+        write(&root.join("Tv Show/s.mkv"), b"small identical content");
+        // Already hardlinked: one inode, never a group on its own.
+        write(
+            &root.join("Torrents/linked.mkv"),
+            b"linked once, two names!",
+        );
+        fs::hard_link(root.join("Torrents/linked.mkv"), root.join("Tv/linked.mkv")).unwrap();
+
+        let db = tmp.0.join("dedupe.db");
+        assert!(matches!(
+            scan(&db, &settings_for(&root)),
+            ScanOutcome::Completed { .. }
+        ));
+        let big_size = big.len() as i64;
+        assert_eq!(
+            groups(&db),
+            vec![(23, 2, 23), (big_size, 2, big_size)],
+            "only the true duplicate pairs"
+        );
+        let conn = open_connection(&db).unwrap();
+        let labels: Vec<String> = conn
+            .prepare("SELECT pair_label FROM dup_groups ORDER BY size")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(labels, vec!["Tv ↔ Tv Show", "Films ↔ Movies"]);
+        let page = |filter: super::super::groups::GroupsFilter| {
+            super::super::groups::list_groups(&conn, &filter, Some((100000, 100000))).unwrap()
+        };
+        let all = page(super::super::groups::GroupsFilter {
+            limit: 10,
+            ..Default::default()
+        });
+        assert_eq!(all.total, 2);
+        assert_eq!(all.summary.reclaimable, big_size + 23);
+        // Sorted by reclaimable space, keeper first in each group.
+        assert_eq!(all.groups[0].size, big_size);
+        assert!(all.groups[0].members[0].keep);
+        assert_eq!(all.groups[0].members[0].paths.len(), 1);
+        let films = page(super::super::groups::GroupsFilter {
+            folder: Some(root.join("Films").display().to_string()),
+            limit: 10,
+            ..Default::default()
+        });
+        assert_eq!(films.total, 1);
+        let pair = page(super::super::groups::GroupsFilter {
+            pair: Some("Tv ↔ Tv Show".into()),
+            limit: 10,
+            ..Default::default()
+        });
+        assert_eq!((pair.total, pair.total_reclaimable), (1, 23));
+        let big_only = page(super::super::groups::GroupsFilter {
+            min_size: 1024,
+            limit: 10,
+            ..Default::default()
+        });
+        assert_eq!(big_only.total, 1);
+        // The full pass only read the inodes whose partial hash collided.
+        let full_hashed: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM hashes WHERE full IS NOT NULL AND size > ?1",
+                params![super::super::hash::SMALL_FILE as i64],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(full_hashed, 3, "a, Movies/a and middle; not last-byte");
+    }
+
+    #[test]
+    fn unchanged_files_are_not_rehashed() {
+        let tmp = TempDir::new();
+        let root = tmp.0.join("data");
+        let content = vec![5u8; 4 * MIB];
+        write(&root.join("A/x.mkv"), &content);
+        write(&root.join("B/x.mkv"), &content);
+        let db = tmp.0.join("dedupe.db");
+        let settings = settings_for(&root);
+        scan(&db, &settings);
+        let first = last_run(&db);
+        assert_eq!(first.hash_files, 4, "2 partial + 2 full");
+        scan(&db, &settings);
+        let second = last_run(&db);
+        assert_ne!(first.id, second.id);
+        assert_eq!(second.hash_files, 0);
+        assert_eq!(second.hash_bytes, 0);
+        assert_eq!(groups(&db).len(), 1);
+
+        // Touching one file (new mtime) re-hashes only that inode.
+        let later = filetime::FileTime::from_unix_time(1_500_000_000, 0);
+        filetime::set_file_mtime(root.join("B/x.mkv"), later).unwrap();
+        scan(&db, &settings);
+        assert_eq!(last_run(&db).hash_files, 2, "partial + full of B only");
+        assert_eq!(groups(&db).len(), 1);
+
+        // Diverging content removes the group.
+        write(&root.join("B/x.mkv"), &vec![6u8; 4 * MIB]);
+        scan(&db, &settings);
+        assert!(groups(&db).is_empty());
+    }
+
+    #[test]
+    fn stopped_hashing_resumes_without_rewalking() {
+        let tmp = TempDir::new();
+        let root = tmp.0.join("data");
+        for i in 0..4 {
+            let content = vec![i as u8; 4 * MIB];
+            write(&root.join(format!("A/{i}.mkv")), &content);
+            write(&root.join(format!("B/{i}.mkv")), &content);
+        }
+        let db = tmp.0.join("dedupe.db");
+        let mut settings = settings_for(&root);
+        settings.read_rate_mbps = 40.0; // ~32 MiB to read: about a second
+        let control = Arc::new(RunControl::new());
+        let live = Arc::new(Mutex::new(LiveProgress::default()));
+        let (c2, l2, db2, s2) = (control.clone(), live.clone(), db.clone(), settings.clone());
+        let handle = std::thread::spawn(move || run_scan(&db2, &s2, "manual", false, &c2, &l2));
+        // Wait until hashing is under way, then stop.
+        for _ in 0..200 {
+            if live.lock().unwrap().stage == "full" {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        control.stop();
+        assert!(matches!(
+            handle.join().unwrap().unwrap(),
+            ScanOutcome::Stopped { .. }
+        ));
+        let conn = open_connection(&db).unwrap();
+        let unfinished = store::latest_unfinished_run(&conn).unwrap().unwrap();
+        assert_eq!(unfinished.stage, "hash");
+        let dirs_before = unfinished.dirs_done;
+
+        settings.read_rate_mbps = 0.0;
+        scan(&db, &settings);
+        let done = last_run(&db);
+        assert_eq!(done.id, unfinished.id, "same run resumed");
+        assert_eq!(done.dirs_done, dirs_before, "the walk was not repeated");
+        assert_eq!(groups(&db).len(), 4);
     }
 
     #[test]

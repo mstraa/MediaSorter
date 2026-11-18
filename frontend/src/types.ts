@@ -258,6 +258,13 @@ export interface DedupeLiveStatus {
   entries_per_sec: number;
   io_priority_idle: boolean;
   last_error: string | null;
+  stage: "walk" | "partial" | "full" | "groups";
+  hash_files_total: number;
+  hash_files_done: number;
+  hash_bytes_total: number;
+  hash_bytes_done: number;
+  hash_errors: number;
+  bytes_per_sec: number;
 }
 
 export interface DedupeScanRun extends DedupeScanCounters {
@@ -272,13 +279,18 @@ export interface DedupeScanRun extends DedupeScanCounters {
   elapsed_secs: number;
   last_error: string | null;
   pending_dirs: number;
+  stage: "walk" | "hash";
+  hash_files: number;
+  hash_bytes: number;
+  hash_errors: number;
+  hash_secs: number;
 }
 
 export interface DedupeScanStatus {
   state: "idle" | "running" | "pausing" | "paused" | "stopping";
   live: DedupeLiveStatus | null;
   eta_secs: number | null;
-  eta_basis: "previous_scan" | "queue" | null;
+  eta_basis: "previous_scan" | "queue" | "hash_bytes" | null;
   unfinished_run: DedupeScanRun | null;
   last_completed: DedupeScanRun | null;
   last_outcome: string | null;
@@ -305,4 +317,47 @@ export interface UnusedTorrentsResponse {
   files: DedupeFile[];
   total_count: number;
   total_bytes: number;
+}
+
+export interface DedupeMember {
+  ino: number;
+  nlink: number;
+  uid: number;
+  gid: number;
+  mtime: number;
+  keep: boolean;
+  paths: string[];
+}
+
+export interface DedupeGroup {
+  id: number;
+  size: number;
+  hash: string;
+  inode_count: number;
+  path_count: number;
+  reclaimable: number;
+  pair_label: string;
+  keeper_ino: number | null;
+  owners_differ: boolean;
+  members: DedupeMember[];
+}
+
+export interface DedupePairSummary {
+  label: string;
+  groups: number;
+  reclaimable: number;
+}
+
+export interface DedupeGroupsPage {
+  summary: {
+    groups: number;
+    inodes: number;
+    reclaimable: number;
+    built_at: string | null;
+    by_pair: DedupePairSummary[];
+  };
+  keeper_rule: string;
+  total: number;
+  total_reclaimable: number;
+  groups: DedupeGroup[];
 }

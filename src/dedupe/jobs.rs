@@ -42,6 +42,14 @@ pub struct LiveStatus {
     pub entries_per_sec: f64,
     pub io_priority_idle: bool,
     pub last_error: Option<String>,
+    /// walk | partial | full | groups
+    pub stage: String,
+    pub hash_files_total: i64,
+    pub hash_files_done: i64,
+    pub hash_bytes_total: i64,
+    pub hash_bytes_done: i64,
+    pub hash_errors: i64,
+    pub bytes_per_sec: f64,
 }
 
 impl ScanJobs {
@@ -177,6 +185,15 @@ impl ScanJobs {
                 (live.totals.entries_seen - live.session_base.entries_seen) as f64 / session_secs,
             )
         };
+        let hash_secs = live
+            .hash_session_started
+            .map(|s| s.elapsed().as_secs_f64())
+            .unwrap_or(0.0);
+        let bytes_per_sec = if live.paused || hash_secs < 1.0 {
+            0.0
+        } else {
+            (live.hash_bytes_done - live.hash_session_base) as f64 / hash_secs
+        };
         let elapsed_secs = live.elapsed_before + if live.paused { 0.0 } else { session_secs };
         Some(LiveStatus {
             state,
@@ -192,6 +209,17 @@ impl ScanJobs {
             entries_per_sec,
             io_priority_idle: live.io_priority_idle,
             last_error: live.last_error,
+            stage: if live.stage.is_empty() {
+                "walk".into()
+            } else {
+                live.stage
+            },
+            hash_files_total: live.hash_files_total,
+            hash_files_done: live.hash_files_done,
+            hash_bytes_total: live.hash_bytes_total,
+            hash_bytes_done: live.hash_bytes_done,
+            hash_errors: live.hash_errors,
+            bytes_per_sec,
         })
     }
 }

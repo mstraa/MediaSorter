@@ -1459,3 +1459,62 @@ details summary {
 .dedupe-root-table td {
   overflow-wrap: anywhere;
 }
+
+.dedupe-stage {
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--orange);
+  margin: 0.6rem 0 0;
+}
+
+.dedupe-pairs tr.clickable-row {
+  cursor: pointer;
+}
+
+.dedupe-pairs tr.selected-row td {
+  color: var(--orange);
+}
+
+.dedupe-group {
+  margin-top: 0.85rem;
+}
+
+.dedupe-group .group-show {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0.6rem;
+}
+
+.dedupe-hash {
+  margin-left: auto;
+}
+
+.dedupe-folder-filter input {
+  min-width: 260px;
+}
+
+.dedupe-keep td {
+  background: rgba(101, 209, 127, 0.05);
+}
+
+.dedupe-group table {
+  table-layout: fixed;
+  width: 100%;
+}
+
+.dedupe-group th:nth-child(1) {
+  width: 120px;
+}
+
+.dedupe-group th:nth-child(2) {
+  width: auto;
+}
+
+.dedupe-group th:nth-child(n + 3) {
+  width: 110px;
+}
+
+.dedupe-group .path-cell div {
+  overflow-wrap: anywhere;
+}

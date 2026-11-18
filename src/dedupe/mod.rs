@@ -5,12 +5,17 @@
 //! - `settings` — `dedupe_*` settings, exclusion matcher, scan time window.
 //! - `store`    — `dedupe.db` (own connection, WAL) schema and read queries.
 //! - `throttle` — stat/byte rate limiting, pause/stop control, idle I/O class.
-//! - `scan`     — phase 1 metadata walk (resumable, incremental).
+//! - `scan`     — phase 1 metadata walk (resumable, incremental), then runs
+//!   the hash stage and rebuilds the groups.
+//! - `hash`     — phase 2 partial/full BLAKE3 hashing per inode.
+//! - `groups`   — phase 2 duplicate groups, keeper rule, folder-pair labels.
 //! - `jobs`     — background scan thread with pause/resume/cancel.
 //!
 //! Data safety: phases 1 and 2 are read-only on the media; nothing is ever
 //! modified without an explicit user action.
 
+pub mod groups;
+pub mod hash;
 pub mod jobs;
 pub mod scan;
 pub mod settings;
@@ -73,8 +78,9 @@ pub struct ScanStatus {
     pub live: Option<LiveStatus>,
     /// Estimated seconds left, when there is a basis for one.
     pub eta_secs: Option<f64>,
-    /// "previous_scan" (directory count of the last full scan) or "queue"
-    /// (only the known frontier — a lower bound on a first scan).
+    /// Walk: "previous_scan" (directory count of the last full scan) or
+    /// "queue" (only the known frontier — a lower bound on a first scan).
+    /// Hashing: "hash_bytes" (bytes left in the current pass).
     pub eta_basis: Option<&'static str>,
     pub unfinished_run: Option<ScanRunRow>,
     pub last_completed: Option<ScanRunRow>,
@@ -197,6 +203,19 @@ impl DedupeService {
         };
         let (last_outcome, last_error) = self.inner.scans.last_outcome();
         let (eta_secs, eta_basis) = match &live {
+            Some(live) if live.stage == "partial" || live.stage == "full" => {
+                if live.bytes_per_sec > 0.0 {
+                    (
+                        Some(
+                            (live.hash_bytes_total - live.hash_bytes_done).max(0) as f64
+                                / live.bytes_per_sec,
+                        ),
+                        Some("hash_bytes"),
+                    )
+                } else {
+                    (None, None)
+                }
+            }
             Some(live) if live.dirs_per_sec > 0.0 => {
                 let done = live.counters.dirs_done;
                 let previous_total = last_completed

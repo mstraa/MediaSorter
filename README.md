@@ -113,7 +113,9 @@ cd frontend && npm run build   # type-check + bundle the frontend
   inodes of the same filesystem, to later replace them with hardlinks. Phase 1
   ships a throttled, resumable, read-only metadata scan of configurable dedupe
   roots and an **Unused torrents** list (files under the torrent folders that
-  nothing else links to, `nlink = 1`). See `docs/PRD.md` › Duplicates.
+  nothing else links to, `nlink = 1`). Phase 2 adds throttled two-pass BLAKE3
+  hashing and a read-only list of duplicate groups with the space each would
+  free. See `docs/PRD.md` › Duplicates.
 
 ## Import Workflow
 

@@ -84,11 +84,85 @@ CREATE TABLE IF NOT EXISTS files (
     gone_at TEXT
 );
 
+-- Content hashes per inode (phase 2). Valid only while the inode's size and
+-- mtime still match; a mismatch means the file changed and is re-hashed.
+-- `partial` = BLAKE3 over size + head/middle/tail (1 MiB each; the whole
+-- file when it is small, in which case `full` is set too).
+CREATE TABLE IF NOT EXISTS hashes (
+    dev INTEGER NOT NULL,
+    ino INTEGER NOT NULL,
+    size INTEGER NOT NULL,
+    mtime_ns INTEGER NOT NULL,
+    partial BLOB,
+    full BLOB,
+    -- Why hashing failed (unreadable...). Not retried until size/mtime change.
+    error TEXT,
+    hashed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (dev, ino)
+);
+
+-- Duplicate groups (same dev, size and full hash, 2+ inodes), rebuilt at the
+-- end of each hash stage.
+CREATE TABLE IF NOT EXISTS dup_groups (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    dev INTEGER NOT NULL,
+    size INTEGER NOT NULL,
+    full_hash BLOB NOT NULL,
+    inode_count INTEGER NOT NULL,
+    path_count INTEGER NOT NULL DEFAULT 0,
+    -- size × (inodes − 1)
+    reclaimable INTEGER NOT NULL,
+    -- Folders involved, e.g. "Films ↔ Movies".
+    pair_label TEXT NOT NULL DEFAULT '',
+    built_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS dup_group_members (
+    group_id INTEGER NOT NULL REFERENCES dup_groups(id) ON DELETE CASCADE,
+    dev INTEGER NOT NULL,
+    ino INTEGER NOT NULL,
+    size INTEGER NOT NULL,
+    mtime_ns INTEGER NOT NULL,
+    nlink INTEGER NOT NULL,
+    uid INTEGER NOT NULL,
+    gid INTEGER NOT NULL,
+    PRIMARY KEY (group_id, ino)
+);
+
 CREATE INDEX IF NOT EXISTS idx_files_size ON files(size);
 CREATE INDEX IF NOT EXISTS idx_files_inode ON files(dev, ino);
 CREATE INDEX IF NOT EXISTS idx_files_seen_gen ON files(seen_gen);
 CREATE INDEX IF NOT EXISTS idx_scan_queue_run ON scan_queue(run_id, id);
+CREATE INDEX IF NOT EXISTS idx_hashes_partial ON hashes(dev, size, partial);
+CREATE INDEX IF NOT EXISTS idx_hashes_full ON hashes(full);
+CREATE INDEX IF NOT EXISTS idx_dup_groups_reclaimable ON dup_groups(reclaimable DESC);
 "#;
+
+/// Columns added after phase 1 shipped: `(table, column, definition)`.
+const ADDED_COLUMNS: &[(&str, &str, &str)] = &[
+    // walk → hash: a run is complete only once its hash stage is.
+    ("scan_runs", "stage", "TEXT NOT NULL DEFAULT 'walk'"),
+    ("scan_runs", "hash_files", "INTEGER NOT NULL DEFAULT 0"),
+    ("scan_runs", "hash_bytes", "INTEGER NOT NULL DEFAULT 0"),
+    ("scan_runs", "hash_errors", "INTEGER NOT NULL DEFAULT 0"),
+    ("scan_runs", "hash_secs", "REAL NOT NULL DEFAULT 0"),
+];
+
+fn add_missing_columns(conn: &Connection) -> StoreResult<()> {
+    for (table, column, definition) in ADDED_COLUMNS {
+        let exists: bool = conn.query_row(
+            &format!("SELECT COUNT(*) > 0 FROM pragma_table_info('{table}') WHERE name = ?1"),
+            params![column],
+            |row| row.get(0),
+        )?;
+        if !exists {
+            conn.execute_batch(&format!(
+                "ALTER TABLE {table} ADD COLUMN {column} {definition}"
+            ))?;
+        }
+    }
+    Ok(())
+}
 
 pub fn open_connection(path: &Path) -> StoreResult<Connection> {
     if let Some(parent) = path.parent() {
@@ -97,6 +171,7 @@ pub fn open_connection(path: &Path) -> StoreResult<Connection> {
     let conn = Connection::open(path)?;
     conn.execute_batch(PRAGMAS)?;
     conn.execute_batch(SCHEMA)?;
+    add_missing_columns(&conn)?;
     Ok(conn)
 }
 
@@ -121,6 +196,12 @@ pub struct ScanRunRow {
     pub skipped_errors: i64,
     pub elapsed_secs: f64,
     pub last_error: Option<String>,
+    /// "walk" or "hash".
+    pub stage: String,
+    pub hash_files: i64,
+    pub hash_bytes: i64,
+    pub hash_errors: i64,
+    pub hash_secs: f64,
     /// Directories still queued (only meaningful for an unfinished run).
     pub pending_dirs: i64,
 }
@@ -128,7 +209,8 @@ pub struct ScanRunRow {
 const RUN_COLUMNS: &str = "id, generation, roots, state, trigger, started_at, updated_at, \
     finished_at, dirs_done, entries_seen, files_recorded, bytes_recorded, skipped_small, \
     skipped_recent, skipped_excluded, skipped_other_fs, skipped_errors, elapsed_secs, last_error, \
-    (SELECT COUNT(*) FROM scan_queue q WHERE q.run_id = scan_runs.id)";
+    (SELECT COUNT(*) FROM scan_queue q WHERE q.run_id = scan_runs.id), stage, hash_files, \
+    hash_bytes, hash_errors, hash_secs";
 
 fn map_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<ScanRunRow> {
     let roots: String = row.get(2)?;
@@ -153,6 +235,11 @@ fn map_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<ScanRunRow> {
         elapsed_secs: row.get(17)?,
         last_error: row.get(18)?,
         pending_dirs: row.get(19)?,
+        stage: row.get(20)?,
+        hash_files: row.get(21)?,
+        hash_bytes: row.get(22)?,
+        hash_errors: row.get(23)?,
+        hash_secs: row.get(24)?,
     })
 }
 
@@ -351,7 +438,7 @@ impl DedupeStore {
         )
     }
 
-    /// Forget every scan result and unfinished run. Keeps the operation
+    /// Forget every scan result, hash, group and unfinished run. Keeps the operation
     /// journal (phase 3), which is why this exists instead of deleting the file.
     pub fn clear_scan_cache(&self) -> StoreResult<()> {
         self.lock().execute_batch(
@@ -359,6 +446,9 @@ impl DedupeStore {
              DELETE FROM scan_queue;
              DELETE FROM scan_runs;
              DELETE FROM files;
+             DELETE FROM hashes;
+             DELETE FROM dup_group_members;
+             DELETE FROM dup_groups;
              COMMIT;",
         )
     }
