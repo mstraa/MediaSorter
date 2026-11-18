@@ -1,6 +1,10 @@
 import type {
   BrowseResponse,
+  DedupeGroupSelection,
   DedupeGroupsPage,
+  DedupeHistoryPage,
+  DedupeJob,
+  DedupeZfsInfo,
   DedupeScanStatus,
   DedupeSettings,
   DedupeSettingsView,
@@ -72,6 +76,21 @@ export const api = {
     if (params.minSize) query.set("min_size", String(params.minSize));
     return request<DedupeGroupsPage>(`/api/dedupe/groups?${query.toString()}`);
   },
+  startDedupeJob: (mode: "simulate" | "apply", groups: DedupeGroupSelection[]) =>
+    request<DedupeJob>("/api/dedupe/jobs", {
+      method: "POST",
+      body: JSON.stringify({ mode, groups }),
+    }),
+  getLatestDedupeJob: () => request<DedupeJob | null>("/api/dedupe/jobs"),
+  getDedupeJob: (id: string) => request<DedupeJob>(`/api/dedupe/jobs/${id}`),
+  cancelDedupeJob: (id: string) =>
+    request<{ status: string }>(`/api/dedupe/jobs/${id}/cancel`, { method: "POST" }),
+  getDedupeHistory: (limit: number, offset: number, mode?: string) => {
+    const query = new URLSearchParams({ limit: String(limit), offset: String(offset) });
+    if (mode) query.set("mode", mode);
+    return request<DedupeHistoryPage>(`/api/dedupe/history?${query.toString()}`);
+  },
+  getDedupeSpace: () => request<DedupeZfsInfo>("/api/dedupe/space"),
   getUnusedTorrents: (limit: number, offset: number) =>
     request<UnusedTorrentsResponse>(
       `/api/dedupe/unused-torrents?limit=${limit}&offset=${offset}`,

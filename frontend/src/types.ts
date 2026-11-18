@@ -361,3 +361,70 @@ export interface DedupeGroupsPage {
   total_reclaimable: number;
   groups: DedupeGroup[];
 }
+
+export interface DedupeGroupSelection {
+  group_id: number;
+  keeper_ino: number | null;
+  exclude_inos: number[];
+}
+
+export interface DedupeOpResult {
+  group_id: number;
+  path: string;
+  result: "simulated" | "replaced" | "skipped" | "failed";
+  reason: string | null;
+  freed_bytes: number;
+}
+
+export interface DedupeJob {
+  id: string;
+  mode: "simulate" | "apply";
+  state: "running" | "done" | "cancelled" | "failed";
+  groups_total: number;
+  groups_done: number;
+  paths_total: number;
+  paths_done: number;
+  bytes_to_compare: number;
+  bytes_compared: number;
+  freed_bytes: number;
+  expected_freed_bytes: number;
+  simulated: number;
+  replaced: number;
+  skipped: number;
+  failed: number;
+  current: string;
+  error: string | null;
+  recent: DedupeOpResult[];
+}
+
+export interface DedupeHistoryRow {
+  id: number;
+  job_id: string;
+  mode: "simulate" | "apply";
+  at: string;
+  group_id: number | null;
+  path: string;
+  keeper_path: string | null;
+  content_hash: string | null;
+  before_ino: number | null;
+  before_size: number | null;
+  before_owner: string | null;
+  before_mode: string | null;
+  keeper_ino: number | null;
+  keeper_owner: string | null;
+  after_ino: number | null;
+  result: string;
+  reason: string | null;
+  freed_bytes: number;
+}
+
+export interface DedupeHistoryPage {
+  rows: DedupeHistoryRow[];
+  total: number;
+  total_freed: number;
+}
+
+export interface DedupeZfsInfo {
+  available: boolean;
+  datasets: { name: string; mountpoint: string; used_by_snapshots: number }[];
+}

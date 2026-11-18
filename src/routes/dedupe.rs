@@ -1,15 +1,16 @@
 //! `/api/dedupe/*`: the Duplicates module.
 
-use axum::extract::{Query, State};
+use axum::extract::{Path as AxumPath, Query, State};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+use crate::dedupe::apply::{self, ApplyProgress, ApplyRequest, HistoryPage};
 use crate::dedupe::groups::{self, GroupsFilter, GroupsPage};
 use crate::dedupe::settings::{DedupeSettings, DedupeSettingsPayload};
 use crate::dedupe::store::{self, UnusedTorrents};
-use crate::dedupe::{check_roots, RootsReport, ScanStatus};
+use crate::dedupe::{check_roots, zfs_info, RootsReport, ScanStatus, ZfsInfo};
 use crate::error::{AppError, AppResult};
 use crate::state::AppState;
 
@@ -24,6 +25,11 @@ pub fn router() -> Router<AppState> {
         .route("/api/dedupe/scan/clear", post(clear_scan))
         .route("/api/dedupe/unused-torrents", get(unused_torrents))
         .route("/api/dedupe/groups", get(list_groups))
+        .route("/api/dedupe/jobs", get(latest_job).post(start_job))
+        .route("/api/dedupe/jobs/:id", get(get_job))
+        .route("/api/dedupe/jobs/:id/cancel", post(cancel_job))
+        .route("/api/dedupe/history", get(history))
+        .route("/api/dedupe/space", get(space))
 }
 
 /// Run blocking work (filesystem checks, `dedupe.db` reads) off the async
@@ -214,4 +220,83 @@ async fn list_groups(
     })
     .await??;
     Ok(Json(page))
+}
+
+async fn start_job(
+    State(state): State<AppState>,
+    Json(request): Json<ApplyRequest>,
+) -> AppResult<Json<ApplyProgress>> {
+    let service = state.dedupe.clone();
+    let job = blocking(move || service.start_apply(request))
+        .await?
+        .map_err(AppError::conflict)?;
+    Ok(Json(job.snapshot()))
+}
+
+async fn latest_job(State(state): State<AppState>) -> Json<Option<ApplyProgress>> {
+    Json(state.dedupe.latest_apply_job().map(|job| job.snapshot()))
+}
+
+async fn get_job(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> AppResult<Json<ApplyProgress>> {
+    let job = state
+        .dedupe
+        .apply_job(&id)
+        .ok_or_else(|| AppError::not_found("Unknown duplicate job"))?;
+    Ok(Json(job.snapshot()))
+}
+
+/// Stops between two files, never in the middle of a replacement.
+async fn cancel_job(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> AppResult<Json<Value>> {
+    let job = state
+        .dedupe
+        .apply_job(&id)
+        .ok_or_else(|| AppError::not_found("Unknown duplicate job"))?;
+    job.control.stop();
+    Ok(Json(json!({ "status": "stopping" })))
+}
+
+#[derive(Deserialize)]
+struct HistoryQuery {
+    limit: Option<i64>,
+    offset: Option<i64>,
+    /// simulate | apply
+    mode: Option<String>,
+}
+
+async fn history(
+    State(state): State<AppState>,
+    Query(query): Query<HistoryQuery>,
+) -> AppResult<Json<HistoryPage>> {
+    let service = state.dedupe.clone();
+    let page = blocking(move || {
+        let mode = query.mode.filter(|m| m == "simulate" || m == "apply");
+        let conn = service.store().lock();
+        apply::history(
+            &conn,
+            mode.as_deref(),
+            query.limit.unwrap_or(200).clamp(1, 2000),
+            query.offset.unwrap_or(0).max(0),
+        )
+    })
+    .await?
+    .map_err(|e| {
+        AppError::new(
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            format!("dedupe.db error: {e}"),
+        )
+    })?;
+    Ok(Json(page))
+}
+
+async fn space(State(state): State<AppState>) -> AppResult<Json<ZfsInfo>> {
+    let service = state.dedupe.clone();
+    Ok(Json(
+        blocking(move || zfs_info(&service.settings().roots)).await?,
+    ))
 }

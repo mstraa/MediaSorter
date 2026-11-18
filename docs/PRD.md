@@ -134,7 +134,9 @@ the app.
 
 - **Duplicates:** scan status and controls (walk and hashing progress, speed, time left),
   duplicate groups sorted by recoverable space with a per-folder-pair summary and filters by
-  pair, folder and size, Unused torrents; operation history follows in phase 3.
+  pair, folder and size, selection with a per-group kept file and exclusions, Simulate and
+  Replace with hardlinks (confirmation dialog), live job progress, Unused torrents, History of
+  every simulated or performed replacement.
 
 - **Settings:** input/output roots, copy speed limit, folder picker, permission checks.
 - **Browse:** input-root navigation, human-readable sizes (e.g. `1,34 Go`), multi-select,
@@ -177,7 +179,7 @@ Delivery is phased; each phase is reviewed before the next:
 
 - **Phase 1 (done):** settings, `dedupe.db`, metadata scan, Unused torrents. Read-only.
 - **Phase 2 (done):** partial then full (BLAKE3) hashing, duplicate groups, read-only Duplicates list.
-- **Phase 3:** simulation, hardlink replacement with re-verification, journal, crash recovery.
+- **Phase 3 (done):** simulation, hardlink replacement with re-verification, journal, crash recovery.
 
 ### Settings (Settings › Duplicates)
 
@@ -228,7 +230,27 @@ window (`01:00-07:00`), preferred owner of the kept inode (default `100000:10000
 `POST /api/dedupe/scan/pause|resume|cancel|clear`, `GET /api/dedupe/scan/status`,
 `GET /api/dedupe/unused-torrents?limit&offset`,
 `GET /api/dedupe/groups?limit&offset&pair&folder&min_size` (folder must be inside the dedupe
-roots). Planned: `POST /api/dedupe/jobs`, `GET /api/dedupe/jobs/:id`, `GET /api/dedupe/history`.
+roots), `POST /api/dedupe/jobs` (`{ "mode": "simulate"|"apply", "groups": [{ "group_id",
+"keeper_ino", "exclude_inos" }] }`), `GET /api/dedupe/jobs` (latest), `GET /api/dedupe/jobs/:id`,
+`POST /api/dedupe/jobs/:id/cancel`, `GET /api/dedupe/history?limit&offset&mode`,
+`GET /api/dedupe/space` (ZFS `usedbysnapshots` per dataset when the `zfs` command exists).
+
+### Replacement (phase 3)
+
+- The user selects groups, may pick another kept file per group and untick duplicates, then
+  runs a **simulation** (no content read, nothing written) or a **replacement** behind a
+  confirmation that states it is irreversible and requires an "I understand" tick.
+- One job at a time; it never runs alongside a scan (each refuses while the other runs). Stop
+  takes effect between two files, never in the middle of a replacement.
+- Simulation re-checks each path (present, unchanged since the scan, folder writable) and notes
+  owner/permission changes and inodes with links outside the selection (no space freed).
+- Every simulated, replaced, skipped or failed path is journaled in `dedupe_ops` (before/after
+  inode, size, owner, mode, kept path, hash, reason, freed bytes). The journal survives
+  `scan/clear`. A replacement cannot be undone: the History tab says so.
+- Crash safety: a `pending_links` row is committed before each `link`, removed after the
+  `rename`. At startup, listed `.ms-dedupe-*.tmp` files that are regular files with
+  `nlink ≥ 2` are removed; nothing else is touched.
+- No automatic `chown`: linked paths share the kept inode's owner, mode, mtime and xattrs.
 
 ### Safety (all phases)
 
