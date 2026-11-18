@@ -109,13 +109,17 @@ cd frontend && npm run build   # type-check + bundle the frontend
 - Toggle light/dark theme in the browser.
 - Expose `GET /health` for service health checks.
 - Provide Proxmox LXC creation, update, and media-mount access helper scripts.
-- **Duplicates (in progress):** find files with identical content on different
-  inodes of the same filesystem, to later replace them with hardlinks. Phase 1
+- **Duplicates:** find files with identical content on different inodes of the
+  same filesystem and, after a simulation and an explicit confirmation, replace
+  them with hardlinks to one inode. Phase 1
   ships a throttled, resumable, read-only metadata scan of configurable dedupe
   roots and an **Unused torrents** list (files under the torrent folders that
   nothing else links to, `nlink = 1`). Phase 2 adds throttled two-pass BLAKE3
   hashing and a read-only list of duplicate groups with the space each would
-  free. See `docs/PRD.md` › Duplicates.
+  free. Phase 3 adds the replacement itself: each file is re-checked and compared
+  byte for byte just before an atomic link + rename (never a copy), every
+  operation is journaled in a History tab, and leftovers of an interrupted run
+  are cleaned at startup. See `docs/PRD.md` › Duplicates.
 
 ## Import Workflow
 

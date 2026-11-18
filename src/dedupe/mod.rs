@@ -1,5 +1,5 @@
 //! "Duplicates" module: find files with identical content on different inodes
-//! of the same filesystem and (phase 3) replace them with hardlinks.
+//! of the same filesystem and, on explicit request, replace them with hardlinks.
 //!
 //! Layout:
 //! - `settings` — `dedupe_*` settings, exclusion matcher, scan time window.
@@ -10,10 +10,13 @@
 //! - `hash`     — phase 2 partial/full BLAKE3 hashing per inode.
 //! - `groups`   — phase 2 duplicate groups, keeper rule, folder-pair labels.
 //! - `jobs`     — background scan thread with pause/resume/cancel.
+//! - `apply`    — phase 3 simulate/replace jobs, `dedupe_ops` journal and
+//!   startup recovery of interrupted replacements.
 //!
-//! Data safety: phases 1 and 2 are read-only on the media; nothing is ever
-//! modified without an explicit user action.
+//! Data safety: scanning and hashing are read-only on the media; only an
+//! explicit replace job modifies anything, one verified file at a time.
 
+pub mod apply;
 pub mod groups;
 pub mod hash;
 pub mod jobs;
@@ -29,6 +32,7 @@ use std::time::Duration;
 use serde::Serialize;
 
 use crate::db::Database;
+use apply::{ApplyJob, ApplyJobs, ApplyRequest};
 use jobs::{LiveStatus, ScanJobs};
 use settings::DedupeSettings;
 use store::{DedupeStore, InventorySummary, ScanRunRow};
@@ -48,6 +52,7 @@ struct Inner {
     db: Database,
     store: DedupeStore,
     scans: ScanJobs,
+    applies: ApplyJobs,
 }
 
 /// Per-root health shown in Settings and on the Duplicates page.
@@ -96,7 +101,12 @@ impl DedupeService {
         let store = DedupeStore::open(dedupe_db_path)?;
         let scans = ScanJobs::new(dedupe_db_path.to_path_buf());
         Ok(Self {
-            inner: Arc::new(Inner { db, store, scans }),
+            inner: Arc::new(Inner {
+                db,
+                store,
+                scans,
+                applies: ApplyJobs::default(),
+            }),
         })
     }
 
@@ -115,6 +125,13 @@ impl DedupeService {
     /// Process start: a run left `running` was cut short by a crash or a
     /// restart; mark it resumable. Then start the automatic-scan scheduler.
     pub fn startup(&self) {
+        // Crash recovery first: remove `.ms-dedupe-*.tmp` links an
+        // interrupted replacement left behind (extra links, never data).
+        match apply::recover_pending_links(&self.inner.store.lock(), &apply::RealFs) {
+            Ok(n) if n > 0 => tracing::info!("dedupe: removed {n} leftover temporary link(s)"),
+            Ok(_) => {}
+            Err(e) => tracing::warn!("dedupe: cannot check leftover temporary links: {e}"),
+        }
         match self.inner.store.mark_running_interrupted() {
             Ok(n) if n > 0 => tracing::info!("dedupe: {n} interrupted scan run(s) can be resumed"),
             Ok(_) => {}
@@ -143,7 +160,11 @@ impl DedupeService {
                 tracing::info!("dedupe: scan window closed, stopping (resumable)");
                 self.inner.scans.cancel();
             }
-            (true, None) if !settings.roots.is_empty() && self.auto_scan_due() => {
+            (true, None)
+                if !settings.roots.is_empty()
+                    && self.inner.applies.running().is_none()
+                    && self.auto_scan_due() =>
+            {
                 tracing::info!("dedupe: scan window open, starting automatic scan");
                 if let Err(e) = self.inner.scans.start(settings, "schedule", false) {
                     tracing::warn!("dedupe: automatic scan not started: {e}");
@@ -172,7 +193,35 @@ impl DedupeService {
         if settings.roots.is_empty() {
             return Err("Configure at least one dedupe root in Settings first".into());
         }
+        if self.inner.applies.running().is_some() {
+            return Err("A duplicate job is running; wait for it to finish".into());
+        }
         self.inner.scans.start(settings, "manual", fresh)
+    }
+
+    /// Start a simulation or a hardlink replacement for the selected groups.
+    pub fn start_apply(&self, request: ApplyRequest) -> Result<Arc<ApplyJob>, String> {
+        if request.groups.is_empty() {
+            return Err("Select at least one group".into());
+        }
+        if self.inner.scans.is_running() {
+            return Err("Stop or wait for the running scan first".into());
+        }
+        let settings = self.settings();
+        if settings.roots.is_empty() {
+            return Err("No dedupe roots configured".into());
+        }
+        self.inner
+            .applies
+            .start(self.inner.store.path().to_path_buf(), settings, request)
+    }
+
+    pub fn apply_job(&self, id: &str) -> Option<Arc<ApplyJob>> {
+        self.inner.applies.get(id)
+    }
+
+    pub fn latest_apply_job(&self) -> Option<Arc<ApplyJob>> {
+        self.inner.applies.latest()
     }
 
     pub fn pause_scan(&self) -> bool {
@@ -263,6 +312,69 @@ impl DedupeService {
             .store
             .clear_scan_cache()
             .map_err(|e| format!("dedupe.db error: {e}"))
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ZfsDataset {
+    pub name: String,
+    pub mountpoint: String,
+    pub used_by_snapshots: u64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ZfsInfo {
+    /// The `zfs` command ran (usually not inside an LXC).
+    pub available: bool,
+    /// Datasets holding the dedupe roots.
+    pub datasets: Vec<ZfsDataset>,
+}
+
+/// `usedbysnapshots` of the datasets that hold the roots, when the `zfs`
+/// command is available. Freed space only comes back once the snapshots
+/// that still reference the old inodes expire.
+pub fn zfs_info(roots: &[PathBuf]) -> ZfsInfo {
+    let output = std::process::Command::new("zfs")
+        .args(["list", "-H", "-p", "-o", "name,mountpoint,usedbysnapshots"])
+        .output();
+    let Ok(output) = output else {
+        return ZfsInfo {
+            available: false,
+            datasets: Vec::new(),
+        };
+    };
+    if !output.status.success() {
+        return ZfsInfo {
+            available: false,
+            datasets: Vec::new(),
+        };
+    }
+    let all: Vec<ZfsDataset> = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.split('\t');
+            Some(ZfsDataset {
+                name: parts.next()?.to_string(),
+                mountpoint: parts.next()?.to_string(),
+                used_by_snapshots: parts.next()?.trim().parse().ok()?,
+            })
+        })
+        .collect();
+    let mut datasets: Vec<ZfsDataset> = Vec::new();
+    for root in roots {
+        let best = all
+            .iter()
+            .filter(|d| d.mountpoint.starts_with('/') && root.starts_with(&d.mountpoint))
+            .max_by_key(|d| d.mountpoint.len());
+        if let Some(best) = best {
+            if !datasets.iter().any(|d| d.name == best.name) {
+                datasets.push(best.clone());
+            }
+        }
+    }
+    ZfsInfo {
+        available: true,
+        datasets,
     }
 }
 

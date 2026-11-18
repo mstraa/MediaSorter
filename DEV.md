@@ -73,7 +73,7 @@ The server lives in the `tvsorter` library crate. Two front-ends reuse it:
 - [x] Backend unit tests (parser, naming, filesystem, formatting, ffprobe mapping, importer).
 - [x] End-to-end smoke test verified (settings → browse → match w/ live TVMaze → import → results → library → history → preview conflict → source-status → folders → embedded SPA).
 
-### Duplicates module (branch `feat/dedupe-hardlinks`)
+### Duplicates module
 
 - [x] Phase 1: `dedupe_*` settings + Settings section with per-root `st_dev` check;
   `dedupe.db` (scan_runs, scan_queue, files); throttled single-thread walk with persisted
@@ -83,9 +83,12 @@ The server lives in the `tvsorter` library crate. Two front-ends reuse it:
   size/mtime check), `dup_groups`/`dup_group_members` rebuilt at the end of each run, read-only
   groups list with folder-pair summary and filters, hashing progress in the scan panel. The
   scan job runs walk → hash → groups; `scan_runs.stage` lets a stopped run resume into hashing.
-- [ ] Phase 3: simulate/apply hardlinks (re-stat, byte compare, link+rename+verify+fsync),
-  `dedupe_ops` journal + History tab, `.ms-dedupe-*.tmp` cleanup at startup, ZFS
-  `usedbysnapshots` note, EXDEV/crash tests.
+- [x] Phase 3: `dedupe::apply` simulate/apply jobs (one at a time, never during a scan):
+  re-lstat, byte-for-byte compare, `pending_links` row → link to `.ms-dedupe-<uuid>.tmp` →
+  rename → verify inode → fsync dir; `dedupe_ops` journal + History tab; startup recovery of
+  leftover tmp links; `/api/dedupe/space` (`zfs list … usedbysnapshots` when available);
+  selection UI (per-group keeper and exclusions, confirmation dialog). Tests go through the
+  `FsOps` trait to inject `EXDEV` and a crash between link and rename.
 
 Notes:
 - Pause and stop take effect between directories (a directory is all-or-nothing inside a
@@ -93,8 +96,15 @@ Notes:
 - Files with an mtime in the future count as "modified too recently" and are skipped.
 - Non-UTF-8 file names are skipped and counted as errors (paths are stored as TEXT and must
   round-trip exactly for phase 3).
-- Never delete `dedupe.db` to reset once phase 3 lands (the journal lives there); use
-  `POST /api/dedupe/scan/clear`.
+- Never delete `dedupe.db` to reset: the `dedupe_ops` journal lives there. Use
+  `POST /api/dedupe/scan/clear` (it keeps the journal).
+- A replacement rebuilds the groups from the scan data right away (the replaced inodes are
+  updated in `files`), so a group partly done or skipped stays listed with fresh numbers.
+- Recovery removes a `.ms-dedupe-*.tmp` only when it is listed in `pending_links`, is a regular
+  file and has `nlink ≥ 2` (the kept file still holds the data); anything else is left alone
+  and logged.
+- Simulation reads no file content; the byte compare only happens in apply mode, throttled by
+  the hash read limit.
 
 ## Confirmed Decisions
 

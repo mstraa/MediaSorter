@@ -7,8 +7,8 @@
 //! scanner opens its own writer connection, and the HTTP handlers read through
 //! a second one; WAL lets those reads proceed while the scanner writes.
 //!
-//! Never delete this file to "reset" the module once phase 3 exists: the
-//! operation journal lives here too. Use [`DedupeStore::clear_scan_cache`].
+//! Never delete this file to "reset" the module: the operation journal
+//! (`dedupe_ops`) lives here too. Use [`DedupeStore::clear_scan_cache`].
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -129,6 +129,44 @@ CREATE TABLE IF NOT EXISTS dup_group_members (
     PRIMARY KEY (group_id, ino)
 );
 
+-- Operation journal (phase 3): one row per path simulated or replaced.
+-- Never cleared by "clear scan cache": an applied replacement cannot be
+-- undone (the old inode is released), so this is the only record of it.
+CREATE TABLE IF NOT EXISTS dedupe_ops (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id TEXT NOT NULL,
+    mode TEXT NOT NULL CHECK (mode IN ('simulate', 'apply')),
+    at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    group_id INTEGER,
+    path TEXT NOT NULL,
+    keeper_path TEXT,
+    content_hash TEXT,
+    before_dev INTEGER,
+    before_ino INTEGER,
+    before_size INTEGER,
+    before_mtime_ns INTEGER,
+    before_uid INTEGER,
+    before_gid INTEGER,
+    before_mode INTEGER,
+    keeper_ino INTEGER,
+    keeper_uid INTEGER,
+    keeper_gid INTEGER,
+    keeper_mode INTEGER,
+    after_ino INTEGER,
+    result TEXT NOT NULL CHECK (result IN ('simulated', 'replaced', 'skipped', 'failed')),
+    reason TEXT,
+    -- Bytes released when this path was the duplicate inode's last link.
+    freed_bytes INTEGER NOT NULL DEFAULT 0
+);
+
+-- Temporary links created by a replacement in progress. A row is committed
+-- before `link()` and removed after `rename()`; rows left by a crash name the
+-- `.ms-dedupe-*.tmp` files to remove at startup.
+CREATE TABLE IF NOT EXISTS pending_links (
+    path TEXT PRIMARY KEY,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
 CREATE INDEX IF NOT EXISTS idx_files_size ON files(size);
 CREATE INDEX IF NOT EXISTS idx_files_inode ON files(dev, ino);
 CREATE INDEX IF NOT EXISTS idx_files_seen_gen ON files(seen_gen);
@@ -136,6 +174,8 @@ CREATE INDEX IF NOT EXISTS idx_scan_queue_run ON scan_queue(run_id, id);
 CREATE INDEX IF NOT EXISTS idx_hashes_partial ON hashes(dev, size, partial);
 CREATE INDEX IF NOT EXISTS idx_hashes_full ON hashes(full);
 CREATE INDEX IF NOT EXISTS idx_dup_groups_reclaimable ON dup_groups(reclaimable DESC);
+CREATE INDEX IF NOT EXISTS idx_dedupe_ops_recent ON dedupe_ops(id DESC);
+CREATE INDEX IF NOT EXISTS idx_dedupe_ops_job ON dedupe_ops(job_id);
 "#;
 
 /// Columns added after phase 1 shipped: `(table, column, definition)`.
