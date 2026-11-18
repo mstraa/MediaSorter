@@ -101,6 +101,25 @@ tvsorter-access --path /mnt/data/Movies --mode owner   # only owner can write
 Hardlinks require source and output on the same filesystem. If they are on different devices,
 use copy.
 
+### One mount for the Duplicates module
+
+Hardlinks fail with `EXDEV` between two LXC mount points **even when both come from the same
+ZFS dataset**: each `mpN` bind mount is its own mount, and the kernel refuses links across
+mounts. For the Duplicates module (and for hardlink imports), mount the whole data dataset
+once and point the dedupe roots at sub-folders of that single mount:
+
+```text
+# /etc/pve/lxc/<id>.conf
+mp0: /ColdGooStore/data,mp=/mnt/data
+```
+
+Dedupe roots would then be `/mnt/data/Torrents`, `/mnt/data/Tv Show`, `/mnt/data/Films`, …
+Settings › Duplicates shows each root's `st_dev` and warns when they differ.
+
+The LXC is privileged, so files the app creates belong to root on the host. The Duplicates
+module creates no data (a hardlink shares the existing inode, owner included), but its scan
+database `dedupe.db` sits next to `tvsorter.db` in the data directory.
+
 ## systemd Unit
 
 `/etc/systemd/system/tvsorter.service`:

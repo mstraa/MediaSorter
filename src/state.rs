@@ -3,6 +3,7 @@ use std::path::PathBuf;
 
 use crate::config::AppConfig;
 use crate::db::Database;
+use crate::dedupe::DedupeService;
 use crate::jobs::JobManager;
 use crate::providers::MetadataProviders;
 
@@ -25,6 +26,7 @@ pub struct AppState {
     pub db: Database,
     pub providers: MetadataProviders,
     pub jobs: JobManager,
+    pub dedupe: DedupeService,
 }
 
 impl AppState {

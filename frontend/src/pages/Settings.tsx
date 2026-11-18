@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { api, ApiError } from "../api";
 import { useProgress } from "../components/Progress";
 import FolderPicker from "../components/FolderPicker";
+import DedupeSettingsSection from "../components/DedupeSettings";
 import type { PermissionCheck } from "../types";
 
 type PickerTarget =
@@ -208,6 +209,8 @@ export default function SettingsPage() {
       ) : (
         <p className="muted">No paths configured yet.</p>
       )}
+
+      <DedupeSettingsSection />
 
       {picker && (
         <FolderPicker

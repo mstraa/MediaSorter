@@ -132,6 +132,9 @@ the app.
 
 ## Web UI Pages
 
+- **Duplicates:** scan status and controls, Unused torrents (phase 1); duplicate groups and
+  operation history follow in phases 2–3.
+
 - **Settings:** input/output roots, copy speed limit, folder picker, permission checks.
 - **Browse:** input-root navigation, human-readable sizes (e.g. `1,34 Go`), multi-select,
   recursive folder expansion, sticky controls, per-source status badges and filter, manual
@@ -154,6 +157,68 @@ the app.
 `GET /api/import-jobs/:id/results`, `GET /api/library`, `POST /api/library/rescan`,
 `GET /api/history`, `GET /api/search`, `GET /api/episodes`, `POST /api/source-status`,
 `GET /api/folders`. All non-API routes serve the embedded SPA (client-side routing fallback).
+
+## Duplicates (hardlink dedupe)
+
+Target: a ZFS raidz of 5400 rpm HDDs (~110 random-read IOPS each) holding several TB and
+hundreds of thousands of files, where Sonarr already hardlinks `Torrents/` into the library but
+many full copies remain (Torrents ↔ media folders, `Films` ↔ `Movies`, `Tv` ↔ `Tv Show`).
+Priority is data safety, then not saturating the pool; an overnight scan is acceptable.
+
+Goals:
+
+1. Scan configurable dedupe roots (separate from input roots) robustly, resumably and throttled.
+2. Detect files with identical content on different inodes of the same filesystem.
+3. After explicit validation, replace duplicates with hardlinks to one inode to free space.
+4. List files under the torrent folders with `nlink == 1` (no longer used by the library).
+
+Delivery is phased; each phase is reviewed before the next:
+
+- **Phase 1 (done):** settings, `dedupe.db`, metadata scan, Unused torrents. Read-only.
+- **Phase 2:** partial then full (BLAKE3) hashing, duplicate groups, read-only Duplicates list.
+- **Phase 3:** simulation, hardlink replacement with re-verification, journal, crash recovery.
+
+### Settings (Settings › Duplicates)
+
+Dedupe roots (one per line; all must share one `st_dev`, otherwise the UI says so), torrent
+folders (inside the roots; guessed from roots named `Torrents` until saved), excluded patterns
+(default `Torrent-work/`, `*.!qB`, `*.part`, `*.tmp`, `.Trash-*`, `.ms-dedupe-*`), minimum size
+(default 50 Mio), minimum age since modification (default 60 min), walk limit in stat calls/s
+(default 200), hash read limit in Mo/s (default 40, `0` = unlimited), optional automatic scan
+window (`01:00-07:00`), preferred owner of the kept inode (default `100000:100000`).
+
+### Metadata scan (phase 1)
+
+- Single thread, no symlink following, never crosses into another `st_dev`, honours exclusions.
+  I/O class IDLE via `ioprio_set` (best effort; on ZFS the throttle is the real guard).
+- Records path, dev, ino, size, mtime, ctime, nlink, uid, gid, mode per regular file into
+  `dedupe.db` (a separate SQLite file next to `tvsorter.db`, WAL, its own connection, so the
+  scan never blocks the UI or imports).
+- Resumable: the directory frontier is persisted; a directory leaves the queue in the same
+  transaction (≤ ~1,000 rows or 2 s) that records its files. Stop, crash or restart resume
+  from the last commit. Changing the roots abandons the unfinished run.
+- Incremental: rows are upserted by path; a completed run marks unseen rows `gone_at`.
+- Runs as a background job with pause, resume and stop (stop keeps progress), progress
+  (folders, entries, files, speed, ETA from the previous full scan's folder count).
+- Automatic scans start or resume inside the configured window (at most one new full scan per
+  20 h) and stop, resumably, when it closes. Manual scans ignore the window.
+
+### API
+
+`GET/PUT /api/dedupe/settings`, `POST /api/dedupe/scan` (`{ "fresh": bool }`),
+`POST /api/dedupe/scan/pause|resume|cancel|clear`, `GET /api/dedupe/scan/status`,
+`GET /api/dedupe/unused-torrents?limit&offset`. Planned: `GET /api/dedupe/groups`,
+`POST /api/dedupe/jobs`, `GET /api/dedupe/jobs/:id`, `GET /api/dedupe/history`.
+
+### Safety (all phases)
+
+Nothing on disk changes without an explicit user action; simulation is the default. Before
+each replacement: re-`stat` (same dev/ino/size/mtime as scanned), then a byte-for-byte compare
+with the kept file; `link` to a `.ms-dedupe-<uuid>.tmp` beside the duplicate, `rename` over it
+(the path is never missing), verify the inode, `fsync` the parent. `EXDEV`/`EPERM`/`EACCES` or
+any change means skip and journal the reason, never a copy fallback. Leftover `.ms-dedupe-*.tmp`
+links are removed at startup. Freed space only returns once ZFS snapshots holding the old inodes
+expire, and files held open (seeding) release their old inode on close.
 
 ## Safety Requirements
 

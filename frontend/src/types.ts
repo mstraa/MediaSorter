@@ -197,3 +197,112 @@ export interface FoldersResponse {
   folders: FolderEntry[];
   roots: string[];
 }
+
+// ---- Duplicates (dedupe) ----
+
+export interface DedupeSettings {
+  roots: string[];
+  torrent_roots: string[];
+  excludes: string[];
+  min_size_mib: string;
+  min_age_minutes: string;
+  stat_rate: string;
+  read_rate_mbps: string;
+  schedule: string;
+  preferred_owner: string;
+}
+
+export interface DedupeRootCheck {
+  path: string;
+  exists: boolean;
+  readable: boolean;
+  device: number | null;
+  nested: boolean;
+  error: string | null;
+}
+
+export interface DedupeRootsReport {
+  roots: DedupeRootCheck[];
+  same_device: boolean;
+  warnings: string[];
+}
+
+export interface DedupeSettingsView {
+  settings: DedupeSettings;
+  report: DedupeRootsReport;
+}
+
+export interface DedupeScanCounters {
+  dirs_done: number;
+  entries_seen: number;
+  files_recorded: number;
+  bytes_recorded: number;
+  skipped_small: number;
+  skipped_recent: number;
+  skipped_excluded: number;
+  skipped_other_fs: number;
+  skipped_errors: number;
+}
+
+export interface DedupeLiveStatus {
+  state: string;
+  trigger: string;
+  run_id: number;
+  generation: number;
+  resumed: boolean;
+  current_dir: string;
+  pending_dirs: number;
+  counters: DedupeScanCounters;
+  elapsed_secs: number;
+  dirs_per_sec: number;
+  entries_per_sec: number;
+  io_priority_idle: boolean;
+  last_error: string | null;
+}
+
+export interface DedupeScanRun extends DedupeScanCounters {
+  id: number;
+  generation: number;
+  roots: string[];
+  state: string;
+  trigger: string;
+  started_at: string;
+  updated_at: string;
+  finished_at: string | null;
+  elapsed_secs: number;
+  last_error: string | null;
+  pending_dirs: number;
+}
+
+export interface DedupeScanStatus {
+  state: "idle" | "running" | "pausing" | "paused" | "stopping";
+  live: DedupeLiveStatus | null;
+  eta_secs: number | null;
+  eta_basis: "previous_scan" | "queue" | null;
+  unfinished_run: DedupeScanRun | null;
+  last_completed: DedupeScanRun | null;
+  last_outcome: string | null;
+  last_error: string | null;
+  inventory: { files: number; bytes: number; inodes: number };
+  schedule: string | null;
+  in_schedule_window: boolean;
+}
+
+export interface DedupeFile {
+  path: string;
+  dev: number;
+  ino: number;
+  size: number;
+  mtime: number;
+  nlink: number;
+  uid: number;
+  gid: number;
+}
+
+export interface UnusedTorrentsResponse {
+  torrent_roots: string[];
+  last_scan_finished_at: string | null;
+  files: DedupeFile[];
+  total_count: number;
+  total_bytes: number;
+}

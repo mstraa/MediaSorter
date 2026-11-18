@@ -40,7 +40,9 @@ src/
   library.rs     output rescan
   assets.rs      embedded SPA serving + fallback
   routes/mod.rs  all HTTP handlers + router
-frontend/        React + TS SPA (pages: Browse, Match, Results, Imports, History, Settings)
+  routes/dedupe.rs  /api/dedupe/* handlers
+  dedupe/        Duplicates module: settings, store (dedupe.db), throttle, scan, jobs
+frontend/        React + TS SPA (pages: Browse, Match, Results, Imports, History, Duplicates, Settings)
 src-tauri/       desktop app (Tauri) — embeds the server via tvsorter::spawn_embedded
 scripts/         create-proxmox-lxc.sh, update-tvsorter.sh, tvsorter-access.sh, build-app.sh, build-desktop.sh
 ```
@@ -71,6 +73,26 @@ The server lives in the `tvsorter` library crate. Two front-ends reuse it:
 - [x] Backend unit tests (parser, naming, filesystem, formatting, ffprobe mapping, importer).
 - [x] End-to-end smoke test verified (settings → browse → match w/ live TVMaze → import → results → library → history → preview conflict → source-status → folders → embedded SPA).
 
+### Duplicates module (branch `feat/dedupe-hardlinks`)
+
+- [x] Phase 1: `dedupe_*` settings + Settings section with per-root `st_dev` check;
+  `dedupe.db` (scan_runs, scan_queue, files); throttled single-thread walk with persisted
+  frontier, savepoint per directory, batched commits, pause/resume/stop, idle I/O class;
+  incremental upserts + `gone_at`; automatic scan window; Unused torrents tab; tests.
+- [ ] Phase 2: `hashes` (partial head/middle/tail, then full BLAKE3, keyed by dev+ino with
+  size/mtime check), `dup_groups`/`dup_group_members`, read-only groups page, folder-pair summary.
+- [ ] Phase 3: simulate/apply hardlinks (re-stat, byte compare, link+rename+verify+fsync),
+  `dedupe_ops` journal + History tab, `.ms-dedupe-*.tmp` cleanup at startup, ZFS
+  `usedbysnapshots` note, EXDEV/crash tests.
+
+Notes:
+- Pause and stop take effect between directories (a directory is all-or-nothing inside a
+  savepoint); a huge directory at a low stat rate can delay a pause by its walk time.
+- Non-UTF-8 file names are skipped and counted as errors (paths are stored as TEXT and must
+  round-trip exactly for phase 3).
+- Never delete `dedupe.db` to reset once phase 3 lands (the journal lives there); use
+  `POST /api/dedupe/scan/clear`.
+
 ## Confirmed Decisions
 
 - Frontend: React + Vite SPA on a JSON API.
@@ -78,6 +100,8 @@ The server lives in the `tvsorter` library crate. Two front-ends reuse it:
 - Repo: configurable placeholder `github.com/mstraa/TvSorterV2`, `--repo` override in scripts.
 - Scope: V1 parity + close Known Gaps (ffprobe fallback, episode dropdown, multi-season anime).
 - DB layer: rusqlite single connection behind a mutex (no sqlx, to keep in-LXC compilation simple).
+- Duplicates data lives in a separate `dedupe.db` with its own connections (scanner writer +
+  API reader) so long scans never contend with the main database mutex.
 
 ## Known Gaps / Follow-ups
 

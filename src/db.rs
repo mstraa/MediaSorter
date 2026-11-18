@@ -262,6 +262,20 @@ impl Database {
         .unwrap_or_else(|| default.to_string())
     }
 
+    /// The stored value, or `None` when the key was never saved (as opposed
+    /// to saved empty).
+    pub fn get_setting_opt(&self, key: &str) -> Option<String> {
+        let conn = self.lock();
+        conn.query_row(
+            "SELECT value FROM settings WHERE key = ?1",
+            params![key],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .ok()
+        .flatten()
+    }
+
     pub fn set_setting(&self, key: &str, value: &str) {
         let conn = self.lock();
         let _ = conn.execute(
